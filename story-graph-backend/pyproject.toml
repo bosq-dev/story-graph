@@ -1,0 +1,16 @@
+[project]
+name = "story-graph-backend"
+version = "0.1.0"
+description = "Demo backend that turns chat conversations into a Neo4j knowledge graph"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+	"fastapi>=0.115.0",
+	"neo4j>=5.27.0",
+	"openai>=1.68.2",
+	"pydantic-settings>=2.8.1",
+	"uvicorn>=0.34.0",
+]
+
+[project.scripts]
+story-graph-backend = "main:main"

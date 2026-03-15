@@ -1,0 +1,71 @@
+services:
+  neo4j:
+    image: neo4j:5.21-community
+    container_name: story-graph-neo4j
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -u ${NEO4J_USERNAME:-neo4j} -p ${NEO4J_PASSWORD:-password} 'RETURN 1' || exit 1",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  backend:
+    build:
+      context: ./story-graph-backend
+      dockerfile: Dockerfile
+    container_name: story-graph-backend
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-password}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      SQLITE_PATH: /data/chat_history.db
+      EXTRACTION_CONFIDENCE_DEFAULT: ${EXTRACTION_CONFIDENCE_DEFAULT:-0.75}
+    ports:
+      - "8000:8000"
+    volumes:
+      - backend_data:/data
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./story-graph-frontend
+      dockerfile: Dockerfile
+    container_name: story-graph-frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  backend_data:

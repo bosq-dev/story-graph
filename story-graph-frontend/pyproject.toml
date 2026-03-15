@@ -1,0 +1,9 @@
+[project]
+name = "story-graph-frontend"
+version = "0.1.0"
+description = "Streamlit frontend for Story Graph demo"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32.0",
+    "streamlit>=1.43.0",
+]
