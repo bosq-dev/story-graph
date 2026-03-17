@@ -5,21 +5,102 @@ import streamlit as st
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
 
+
+def fetch_sessions() -> list[dict]:
+    response = requests.get(f"{BACKEND_URL}/chat/sessions", timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_history(session_id: str) -> list[dict]:
+    response = requests.get(f"{BACKEND_URL}/chat/history", params={"session_id": session_id}, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
+def create_session(user_name: str) -> dict:
+    response = requests.post(f"{BACKEND_URL}/chat/sessions", json={"user_name": user_name}, timeout=20)
+    response.raise_for_status()
+    return response.json()
+
 st.set_page_config(page_title="Story Graph Chat", layout="wide")
 st.title("Story Graph Demo")
 st.caption("Converse normalmente. Enquanto isso, o backend extrai triplas e popula um grafo no Neo4j.")
 
-if "session_id" not in st.session_state:
-    st.session_state.session_id = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if "active_session_id" not in st.session_state:
+    st.session_state.active_session_id = None
+if "active_user_name" not in st.session_state:
+    st.session_state.active_user_name = None
+if "messages_by_session" not in st.session_state:
+    st.session_state.messages_by_session = {}
+if "sessions" not in st.session_state:
+    st.session_state.sessions = []
+if "entities" not in st.session_state:
+    st.session_state.entities = []
+if "relations" not in st.session_state:
+    st.session_state.relations = []
+
+with st.sidebar:
+    st.header("Chats")
+    st.caption("Cada sessao representa um usuario diferente no grafo.")
+
+    if st.button("Atualizar lista", use_container_width=True):
+        try:
+            st.session_state.sessions = fetch_sessions()
+        except requests.RequestException as exc:
+            st.error(f"Erro ao listar chats: {exc}")
+
+    with st.form("new-chat-form", clear_on_submit=True):
+        new_user_name = st.text_input("Nome do usuario", placeholder="Ex.: Fabio")
+        create_clicked = st.form_submit_button("Novo chat", use_container_width=True)
+
+    if create_clicked:
+        if not new_user_name.strip():
+            st.error("Informe o nome do usuario para criar a sessao.")
+        else:
+            try:
+                new_session = create_session(new_user_name.strip())
+                st.session_state.sessions = fetch_sessions()
+                st.session_state.active_session_id = new_session["id"]
+                st.session_state.active_user_name = new_session["user_name"]
+                st.session_state.messages_by_session[new_session["id"]] = []
+                st.rerun()
+            except requests.RequestException as exc:
+                st.error(f"Erro ao criar chat: {exc}")
+
+    if not st.session_state.sessions:
+        try:
+            st.session_state.sessions = fetch_sessions()
+        except requests.RequestException as exc:
+            st.error(f"Erro ao listar chats: {exc}")
+
+    for session in st.session_state.sessions:
+        label = session["title"]
+        if st.button(label, key=f"session-{session['id']}", use_container_width=True):
+            st.session_state.active_session_id = session["id"]
+            st.session_state.active_user_name = session["user_name"]
+            try:
+                history = fetch_history(session["id"])
+                st.session_state.messages_by_session[session["id"]] = history
+            except requests.RequestException as exc:
+                st.error(f"Erro ao carregar historico: {exc}")
+            st.rerun()
+
+active_session_id = st.session_state.active_session_id
+active_user_name = st.session_state.active_user_name
+active_messages = st.session_state.messages_by_session.get(active_session_id, []) if active_session_id else []
 
 left_col, right_col = st.columns([2, 1])
 
 with left_col:
     st.subheader("Chat")
 
-    for item in st.session_state.messages:
+    if active_user_name:
+        st.caption(f"Sessao ativa: {active_user_name}")
+    else:
+        st.info("Crie um novo chat na barra lateral para comecar.")
+
+    for item in active_messages:
         with st.chat_message(item["role"]):
             st.markdown(item["content"])
             triplets = item.get("triplets", [])
@@ -30,28 +111,32 @@ with left_col:
                         f"{t['subject']}, {t['relation']}, {t['object']}, {t['object_type']} (conf={t['confidence']:.2f})"
                     )
 
-    prompt = st.chat_input("Digite sua mensagem")
-    if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    prompt = st.chat_input("Digite sua mensagem", disabled=active_session_id is None)
+    if prompt and active_session_id and active_user_name:
+        session_messages = st.session_state.messages_by_session.setdefault(active_session_id, [])
+        session_messages.append({"role": "user", "content": prompt})
 
         payload = {
             "message": prompt,
-            "session_id": st.session_state.session_id,
-            "user_id": "demo-user",
+            "session_id": active_session_id,
+            "user_id": "-".join(active_user_name.strip().lower().split()) or "user",
+            "user_name": active_user_name,
         }
         try:
             response = requests.post(f"{BACKEND_URL}/chat/message", json=payload, timeout=40)
             response.raise_for_status()
             data = response.json()
 
-            st.session_state.session_id = data["session_id"]
-            st.session_state.messages.append(
+            st.session_state.active_session_id = data["session_id"]
+            st.session_state.active_user_name = data["user_name"]
+            session_messages.append(
                 {
                     "role": "assistant",
                     "content": data["assistant_message"],
                     "triplets": data.get("extracted_triplets", []),
                 }
             )
+            st.session_state.sessions = fetch_sessions()
             st.rerun()
         except requests.RequestException as exc:
             st.error(f"Falha ao chamar backend: {exc}")

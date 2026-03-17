@@ -43,14 +43,17 @@ class LLMExtractor:
         self.model = model
         self.default_confidence = default_confidence
 
-    def build_assistant_reply(self, message: str) -> str:
+    def build_assistant_reply(self, message: str, user_name: str) -> str:
         completion = self.client.chat.completions.create(
             model=self.model,
             temperature=0.4,
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a concise assistant for product and engineering conversations.",
+                    "content": (
+                        "You are a concise assistant for product and engineering conversations. "
+                        f"The current speaker is named {user_name}."
+                    ),
                 },
                 {"role": "user", "content": message},
             ],
@@ -58,7 +61,13 @@ class LLMExtractor:
         content = completion.choices[0].message.content or ""
         return content.strip() or "Posso ajudar a detalhar isso melhor se quiser."
 
-    def extract_triplets(self, message: str) -> list[Triplet]:
+    def extract_triplets(self, message: str, user_name: str) -> list[Triplet]:
+        extraction_request = (
+            f"The speaker's real name is {user_name}. When the speaker refers to themselves, use the same "
+            f"single entity named {user_name} with entity_type User. Extract triplets from the text below. "
+            'Return a JSON object with keys "entities" and "triplets" only.\n\n'
+            f"Text: {message}"
+        )
         try:
             completion = self.client.chat.completions.create(
                 model=self.model,
@@ -66,14 +75,7 @@ class LLMExtractor:
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": EXTRACTION_PROMPT},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Extract triplets from the text below. Return a JSON object in the format "
-                            '{"triplets": [...]} only.\\n\\n'
-                            f"Text: {message}"
-                        ),
-                    },
+                    {"role": "user", "content": extraction_request},
                 ],
             )
         except Exception:
@@ -82,13 +84,7 @@ class LLMExtractor:
                 temperature=0,
                 messages=[
                     {"role": "system", "content": EXTRACTION_PROMPT},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Extract triplets from the text below. Return only valid JSON with key 'triplets'.\\n\\n"
-                            f"Text: {message}"
-                        ),
-                    },
+                    {"role": "user", "content": extraction_request},
                 ],
             )
         raw = completion.choices[0].message.content or "{}"
@@ -96,16 +92,16 @@ class LLMExtractor:
         if isinstance(parsed, dict):
             triplets = self._from_entity_graph(parsed)
             if triplets:
-                return self._reconcile_entity_types(triplets)
+                return self._apply_speaker_name(self._reconcile_entity_types(triplets), user_name)
 
             items = parsed.get("triplets", [])
             if isinstance(items, list):
                 legacy = self._from_legacy_triplets(items)
-                return self._reconcile_entity_types(legacy)
+                return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
 
         if isinstance(parsed, list):
             legacy = self._from_legacy_triplets(parsed)
-            return self._reconcile_entity_types(legacy)
+            return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
 
         return []
 
@@ -240,6 +236,44 @@ class LLMExtractor:
                 )
             )
         return reconciled
+
+    def _apply_speaker_name(self, triplets: list[Triplet], user_name: str) -> list[Triplet]:
+        generic_speaker_names = {
+            "user",
+            "speaker",
+            "customer",
+            "guest",
+            "usuario",
+            "usuário",
+            "cliente",
+            "hospede",
+            "hóspede",
+        }
+        normalized_user_name = user_name.strip()
+        if not normalized_user_name:
+            return triplets
+
+        resolved: list[Triplet] = []
+        for triple in triplets:
+            subject = triple.subject
+            obj = triple.object
+
+            if triple.subject_type == "User" and subject.strip().lower() in generic_speaker_names:
+                subject = normalized_user_name
+            if triple.object_type == "User" and obj.strip().lower() in generic_speaker_names:
+                obj = normalized_user_name
+
+            resolved.append(
+                Triplet(
+                    subject=subject,
+                    subject_type=triple.subject_type,
+                    relation=triple.relation,
+                    object=obj,
+                    object_type=triple.object_type,
+                    confidence=triple.confidence,
+                )
+            )
+        return self._reconcile_entity_types(resolved)
 
     @staticmethod
     def _safe_parse_json(raw: str) -> dict[str, Any] | list[Any]:

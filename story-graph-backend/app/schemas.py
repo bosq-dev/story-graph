@@ -10,6 +10,7 @@ class ChatMessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     session_id: str | None = None
     user_id: str = "user"
+    user_name: str = Field(min_length=1, max_length=120, default="User")
 
 
 class Triplet(BaseModel):
@@ -39,6 +40,7 @@ class Triplet(BaseModel):
 
 class ChatMessageResponse(BaseModel):
     session_id: str
+    user_name: str
     assistant_message: str
     extracted_triplets: list[Triplet]
     stored_triplets_count: int
@@ -50,6 +52,19 @@ class ChatHistoryItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     created_at: datetime
+
+
+class ChatSessionCreateRequest(BaseModel):
+    user_name: str = Field(min_length=1, max_length=120)
+
+
+class ChatSessionSummary(BaseModel):
+    id: str
+    user_id: str
+    user_name: str
+    title: str
+    created_at: datetime
+    last_message_at: datetime | None = None
 
 
 class EntityItem(BaseModel):
