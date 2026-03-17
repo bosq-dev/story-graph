@@ -58,6 +58,56 @@ Tripla esperada:
 
 - `nossa empresa, uses, Kubernetes, Technology`
 
+## Mensagens Boas Para Demo (Hotel Customer Service)
+
+- `Oi, estou no quarto 210 e o ar-condicionado nao esta gelando.`
+- `Pedi toalhas ha 40 minutos e ainda nao chegaram.`
+- `Quero trocar de quarto porque tem cheiro de mofo.`
+- `O chuveiro esta sem agua quente desde ontem.`
+- `Fiz check-in agora e meu quarto ainda nao estava pronto.`
+- `Preciso de nota fiscal da minha estadia para a empresa.`
+- `O barulho no corredor do 5 andar nao me deixou dormir.`
+- `Gostaria de cancelar a reserva de amanha e saber sobre reembolso.`
+
+Essas mensagens normalmente geram entidades como `User`, `Location`, `Issue` e `Activity`, com relacoes uteis para operacao e qualidade.
+
+## Perguntas Interessantes Para Admin
+
+- Quais tipos de reclamacao mais aparecem?
+- Quais quartos/areas acumulam mais problemas?
+- Quais problemas estao ligados a pedidos de troca de quarto?
+- Quais clientes pediram reembolso?
+- Existe pico de reclamacoes por periodo?
+
+## Cypher de Exemplo (Neo4j Browser)
+
+Top issues:
+
+```cypher
+MATCH (:Entity {entity_type:'User'})-[r:RELATED {relation_type:'reported_issue'}]->(i:Entity {entity_type:'Issue'})
+RETURN i.name AS issue, sum(coalesce(r.mentions_count,1)) AS total
+ORDER BY total DESC
+LIMIT 10;
+```
+
+Locais com mais ocorrencias:
+
+```cypher
+MATCH (u:Entity {entity_type:'User'})-[r1:RELATED {relation_type:'reported_issue'}]->(i:Entity {entity_type:'Issue'})
+MATCH (i)-[r2:RELATED {relation_type:'affects_location'}]->(l:Entity {entity_type:'Location'})
+RETURN l.name AS location, count(*) AS issue_events
+ORDER BY issue_events DESC
+LIMIT 10;
+```
+
+Pedidos de acao por tipo:
+
+```cypher
+MATCH (:Entity {entity_type:'User'})-[r:RELATED {relation_type:'requested_action'}]->(a:Entity {entity_type:'Activity'})
+RETURN a.name AS action, sum(coalesce(r.mentions_count,1)) AS total
+ORDER BY total DESC;
+```
+
 
 ## Reset volumes
 docker compose down -v --remove-orphans

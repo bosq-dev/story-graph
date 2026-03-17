@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any, Iterator
 
 from openai import OpenAI
@@ -8,8 +9,9 @@ from app.schemas import Triplet
 
 
 EXTRACTION_PROMPT = """
-You extract knowledge graph data from user messages.
-Return JSON only in this exact shape:
+You extract knowledge graph triplets from customer service conversations.
+Return JSON only with keys "entities" and "triplets".
+Preferred shape:
 {
     "entities": [
         {
@@ -27,14 +29,98 @@ Return JSON only in this exact shape:
         }
     ]
 }
-Rules:
-- Reuse the same entity id when the text refers to the same real-world entity in this message.
-- Do not create duplicate entities with different types for the same thing in one message.
-- Example: "quarto 2" should be a single entity, usually Location.
-- Keep relation short and normalized in snake_case style where possible.
-- If no relevant knowledge exists, return {"entities": [], "triplets": []}
+
+Also accepted for each triplet item: direct fields
+{"subject":"...", "subject_type":"...", "relation":"...", "object":"...", "object_type":"...", "confidence":0.9}
+
+CRITICAL — graph-first extraction:
+- Your primary responsibility in this system is to populate the graph. If there is any complaint, request,
+  or concrete reference (order, room, product, issue), you MUST emit entities and triplets now.
+- Extract entities immediately from PARTIAL information. Do NOT wait for complete data.
+  Example: "Pedido 1234" alone → create entity {"id":"e1","name":"Pedido 1234","entity_type":"Product"}
+  Example: "tamanho errado" alone → create entity {"id":"e2","name":"tamanho errado","entity_type":"Issue"}
+- An order/ticket reference ("pedido 1234", "order #5", "ticket 99") is ALWAYS sufficient to create a Product entity.
+- A complaint or problem is ALWAYS sufficient to create an Issue entity.
+- An action request (troca, devolução, reembolso, cancelamento, limpeza) is ALWAYS an Activity entity.
+- You receive the FULL recent conversation — extract ALL entities and relations visible across all turns,
+  not just the last message. Combine information from different turns into one graph.
+- Reuse the same entity id when the text refers to the same real-world entity.
+- Do not create duplicate entities with different types for the same thing.
+- Keep relations short and normalized in snake_case: reported_issue, requested_action, has_issue,
+  affects_order, affects_location, resolved_by, blocked_by, requested_refund, mentions_product.
+- entity_type rules:
+    Order / Pedido / Ticket → Product
+    Concrete complaint / bug / defect → Issue
+    Action request (troca, refund, fix, cancel) → Activity
+    Person / customer → User
+    Brand / store / company → Company
+    Physical space (quarto, andar, loja) → Location
+    Specific item / SKU → Product
+- If truly no extractable information exists, return {"entities": [], "triplets": []}
 - Never add fields outside the schema.
 """.strip()
+
+ASSISTANT_SYSTEM_PROMPT = """
+You are a customer service assistant.
+
+Goals:
+- Be empathetic and solution-oriented.
+- Acknowledge the complaint clearly.
+- Offer concrete next actions whenever possible.
+
+Critical rules:
+- In this demo, the effective action is to register facts into the knowledge graph.
+    So after acknowledging, prioritize concise resolution guidance and avoid long interrogation loops.
+- You receive the FULL recent conversation history. Use it — never ask for information the customer already provided.
+- Ask at most ONE follow-up question per response. If multiple pieces of info are missing, ask only for the most important one.
+- When you already know the order number / issue / request from history, do NOT ask for it again.
+
+Style:
+- Reply in the same language used by the customer.
+- Be concise, professional, and practical.
+- Do not invent policies, prices, or guarantees.
+""".strip()
+
+PROMPT_PROFILES: dict[str, dict[str, str]] = {
+    "hotel_customer_service": {
+        "label": "Hotel Customer Service",
+        "assistant": (
+            "You are assisting hotel guests with reservations, room issues, amenities and incident handling. "
+                "Prioritize empathy, quick triage, and immediate resolution options. "
+                "If the guest reports a room problem (e.g., bad smell, noise, cleanliness), treat it as a concrete issue "
+                "already logged and avoid repeatedly asking for the same details."
+        ),
+        "extraction": (
+            "Focus on complaints about room conditions, housekeeping delays, check-in/check-out issues, noise, "
+                "billing and refund requests. Always create a Location entity for room references (e.g., 'quarto 2'). "
+                "Always create an Issue entity for room complaints (e.g., smell, dirt, noise). "
+                "Link User -> reported_issue -> Issue and Issue -> affects_location -> Location whenever applicable."
+        ),
+    },
+    "ecommerce_support": {
+        "label": "E-commerce Support",
+        "assistant": (
+            "You are an e-commerce customer support assistant for orders, shipping, returns and refunds. "
+            "Guide users with clear next steps and expected resolution path."
+        ),
+        "extraction": (
+            "Domain: e-commerce. "
+            "Always create a Product entity for any order reference (e.g. 'Pedido 1234' → entity_type Product). "
+            "Always create an Issue entity for wrong items, wrong size, damaged goods, missing items, late delivery. "
+            "Always create an Activity entity for exchange, return, refund or cancellation requests. "
+            "Link User → reported_issue → Issue, Issue → affects_order → Order, User → requested_action → Activity."
+        ),
+    },
+    "saas_support": {
+        "label": "SaaS Support",
+        "assistant": (
+            "You are a SaaS support assistant for account access, billing plans, integrations, incidents and feature requests."
+        ),
+        "extraction": (
+            "Focus on incident reports, blocked workflows, integration requests, subscription changes and feature requests."
+        ),
+    },
+}
 
 
 class LLMExtractor:
@@ -43,39 +129,71 @@ class LLMExtractor:
         self.model = model
         self.default_confidence = default_confidence
 
-    def build_assistant_reply(self, message: str, user_name: str) -> str:
+    @staticmethod
+    def resolve_prompt_profile(prompt_profile: str | None) -> str:
+        normalized = (prompt_profile or "").strip().lower()
+        return normalized if normalized in PROMPT_PROFILES else "hotel_customer_service"
+
+    def _assistant_system_prompt(self, user_name: str, prompt_profile: str) -> str:
+        profile_key = self.resolve_prompt_profile(prompt_profile)
+        profile = PROMPT_PROFILES[profile_key]
+        return (
+            f"{ASSISTANT_SYSTEM_PROMPT} "
+            f"Domain profile: {profile['label']}. "
+            f"{profile['assistant']} "
+            f"The current customer name is {user_name}."
+        )
+
+    def _extraction_system_prompt(self, prompt_profile: str) -> str:
+        profile_key = self.resolve_prompt_profile(prompt_profile)
+        profile = PROMPT_PROFILES[profile_key]
+        return f"Domain profile: {profile['label']}. {profile['extraction']}"
+
+    def build_assistant_reply(
+        self,
+        message: str,
+        user_name: str,
+        prompt_profile: str,
+        history: list[dict] | None = None,
+    ) -> str:
+        messages: list[Any] = [
+            {
+                "role": "system",
+                "content": self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile),
+            }
+        ]
+        for h in (history or [])[-20:]:
+            messages.append({"role": h["role"], "content": h["content"]})
+        messages.append({"role": "user", "content": message})
         completion = self.client.chat.completions.create(
             model=self.model,
             temperature=0.4,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a concise assistant for product and engineering conversations. "
-                        f"The current speaker is named {user_name}."
-                    ),
-                },
-                {"role": "user", "content": message},
-            ],
+            messages=messages,
         )
         content = completion.choices[0].message.content or ""
         return content.strip() or "Posso ajudar a detalhar isso melhor se quiser."
 
-    def stream_assistant_reply(self, message: str, user_name: str) -> Iterator[str]:
+    def stream_assistant_reply(
+        self,
+        message: str,
+        user_name: str,
+        prompt_profile: str,
+        history: list[dict] | None = None,
+    ) -> Iterator[str]:
+        messages: list[Any] = [
+            {
+                "role": "system",
+                "content": self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile),
+            }
+        ]
+        for h in (history or [])[-20:]:
+            messages.append({"role": h["role"], "content": h["content"]})
+        messages.append({"role": "user", "content": message})
         stream = self.client.chat.completions.create(
             model=self.model,
             temperature=0.4,
             stream=True,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a concise assistant for product and engineering conversations. "
-                        f"The current speaker is named {user_name}."
-                    ),
-                },
-                {"role": "user", "content": message},
-            ],
+            messages=messages,
         )
 
         for chunk in stream:
@@ -86,12 +204,27 @@ class LLMExtractor:
             if content:
                 yield content
 
-    def extract_triplets(self, message: str, user_name: str) -> list[Triplet]:
+    def extract_triplets(
+        self,
+        message: str,
+        user_name: str,
+        prompt_profile: str,
+        history: list[dict] | None = None,
+    ) -> list[Triplet]:
+        # Build conversation context from history + current message
+        history_lines = [
+            f"{h['role'].upper()}: {h['content']}"
+            for h in (history or [])[-20:]
+        ]
+        history_lines.append(f"USER: {message}")
+        conversation_text = "\n".join(history_lines)
+
         extraction_request = (
-            f"The speaker's real name is {user_name}. When the speaker refers to themselves, use the same "
-            f"single entity named {user_name} with entity_type User. Extract triplets from the text below. "
+            f"The customer's real name is {user_name}. When the speaker refers to themselves, use the same "
+            f"single entity named {user_name} with entity_type User. "
+            "Extract ALL entities and relations visible in the full conversation below. "
             'Return a JSON object with keys "entities" and "triplets" only.\n\n'
-            f"Text: {message}"
+            f"Conversation:\n{conversation_text}"
         )
         try:
             completion = self.client.chat.completions.create(
@@ -100,6 +233,7 @@ class LLMExtractor:
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": EXTRACTION_PROMPT},
+                    {"role": "system", "content": self._extraction_system_prompt(prompt_profile)},
                     {"role": "user", "content": extraction_request},
                 ],
             )
@@ -109,6 +243,7 @@ class LLMExtractor:
                 temperature=0,
                 messages=[
                     {"role": "system", "content": EXTRACTION_PROMPT},
+                    {"role": "system", "content": self._extraction_system_prompt(prompt_profile)},
                     {"role": "user", "content": extraction_request},
                 ],
             )
@@ -122,11 +257,13 @@ class LLMExtractor:
             items = parsed.get("triplets", [])
             if isinstance(items, list):
                 legacy = self._from_legacy_triplets(items)
-                return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
+                if legacy:
+                    return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
 
         if isinstance(parsed, list):
             legacy = self._from_legacy_triplets(parsed)
-            return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
+            if legacy:
+                return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
 
         return []
 
@@ -137,30 +274,63 @@ class LLMExtractor:
             return []
 
         entities: dict[str, dict[str, str]] = {}
+        entities_by_name: dict[str, dict[str, str]] = {}
         for item in entities_raw:
             if not isinstance(item, dict):
                 continue
-            entity_id = str(item.get("id", "")).strip()
             name = str(item.get("name", "")).strip()
             entity_type = str(item.get("entity_type", "Concept")).strip()
-            if not entity_id or not name:
+            if not name:
                 continue
             if entity_type not in ALLOWED_ENTITY_TYPES:
                 entity_type = "Concept"
-            entities[entity_id] = {"name": name, "entity_type": entity_type}
+            normalized_name = self._normalize_entity_name(name)
+            entity_id = str(item.get("id", "")).strip() or f"name:{normalized_name}"
+            entity_payload = {"name": name, "entity_type": entity_type}
+            entities[entity_id] = entity_payload
+            entities_by_name[normalized_name] = entity_payload
 
         result: list[Triplet] = []
         for item in triplets_raw:
             if not isinstance(item, dict):
                 continue
+            relation = str(item.get("relation", item.get("predicate", ""))).strip()
+            confidence = item.get("confidence", self.default_confidence)
+            if not relation:
+                continue
+
+            subject_entity = None
+            object_entity = None
+
             subject_id = str(item.get("subject_id", "")).strip()
             object_id = str(item.get("object_id", "")).strip()
-            relation = str(item.get("relation", "")).strip()
-            confidence = item.get("confidence", self.default_confidence)
-            if not subject_id or not object_id or not relation:
-                continue
-            subject_entity = entities.get(subject_id)
-            object_entity = entities.get(object_id)
+            if subject_id:
+                subject_entity = entities.get(subject_id)
+            if object_id:
+                object_entity = entities.get(object_id)
+
+            if subject_entity is None:
+                subject_name = str(item.get("subject", "")).strip()
+                subject_type = str(item.get("subject_type", "Concept")).strip()
+                if subject_name:
+                    if subject_type not in ALLOWED_ENTITY_TYPES:
+                        subject_type = "Concept"
+                    subject_entity = entities_by_name.get(
+                        self._normalize_entity_name(subject_name),
+                        {"name": subject_name, "entity_type": subject_type},
+                    )
+
+            if object_entity is None:
+                object_name = str(item.get("object", "")).strip()
+                object_type = str(item.get("object_type", "Concept")).strip()
+                if object_name:
+                    if object_type not in ALLOWED_ENTITY_TYPES:
+                        object_type = "Concept"
+                    object_entity = entities_by_name.get(
+                        self._normalize_entity_name(object_name),
+                        {"name": object_name, "entity_type": object_type},
+                    )
+
             if not subject_entity or not object_entity:
                 continue
             normalized = self._normalize_item(
@@ -305,4 +475,30 @@ class LLMExtractor:
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            return {"triplets": []}
+            pass
+
+        fenced_match = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", raw, flags=re.DOTALL)
+        if fenced_match:
+            candidate = fenced_match.group(1)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+        object_match = re.search(r"(\{.*\})", raw, flags=re.DOTALL)
+        if object_match:
+            candidate = object_match.group(1)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+        array_match = re.search(r"(\[.*\])", raw, flags=re.DOTALL)
+        if array_match:
+            candidate = array_match.group(1)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+        return {"triplets": []}

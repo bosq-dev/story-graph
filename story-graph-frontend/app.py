@@ -6,6 +6,12 @@ import streamlit as st
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
 
+PROMPT_PROFILE_OPTIONS = {
+    "hotel_customer_service": "Hotel Customer Service",
+    "ecommerce_support": "E-commerce Reclamações",
+    "saas_support": "SaaS Support",
+}
+
 
 def fetch_sessions() -> list[dict]:
     response = requests.get(f"{BACKEND_URL}/chat/sessions", timeout=20)
@@ -42,10 +48,23 @@ if "relations" not in st.session_state:
     st.session_state.relations = []
 if "is_sending" not in st.session_state:
     st.session_state.is_sending = False
+if "prompt_profile_by_session" not in st.session_state:
+    st.session_state.prompt_profile_by_session = {}
+if "default_prompt_profile" not in st.session_state:
+    st.session_state.default_prompt_profile = "hotel_customer_service"
 
 with st.sidebar:
     st.header("Chats")
     st.caption("Cada sessao representa um usuario diferente no grafo.")
+
+    selected_profile = st.selectbox(
+        "Perfil de system prompt",
+        options=list(PROMPT_PROFILE_OPTIONS.keys()),
+        format_func=lambda key: PROMPT_PROFILE_OPTIONS[key],
+        index=list(PROMPT_PROFILE_OPTIONS.keys()).index(st.session_state.default_prompt_profile),
+        key="prompt-profile-selector",
+    )
+    st.session_state.default_prompt_profile = selected_profile
 
     if st.button("Atualizar lista", use_container_width=True):
         try:
@@ -67,6 +86,7 @@ with st.sidebar:
                 st.session_state.active_session_id = new_session["id"]
                 st.session_state.active_user_name = new_session["user_name"]
                 st.session_state.messages_by_session[new_session["id"]] = []
+                st.session_state.prompt_profile_by_session[new_session["id"]] = st.session_state.default_prompt_profile
                 st.rerun()
             except requests.RequestException as exc:
                 st.error(f"Erro ao criar chat: {exc}")
@@ -82,6 +102,8 @@ with st.sidebar:
         if st.button(label, key=f"session-{session['id']}", use_container_width=True):
             st.session_state.active_session_id = session["id"]
             st.session_state.active_user_name = session["user_name"]
+            if session["id"] not in st.session_state.prompt_profile_by_session:
+                st.session_state.prompt_profile_by_session[session["id"]] = st.session_state.default_prompt_profile
             try:
                 history = fetch_history(session["id"])
                 st.session_state.messages_by_session[session["id"]] = history
@@ -92,6 +114,15 @@ with st.sidebar:
 active_session_id = st.session_state.active_session_id
 active_user_name = st.session_state.active_user_name
 active_messages = st.session_state.messages_by_session.get(active_session_id, []) if active_session_id else []
+active_prompt_profile = (
+    st.session_state.prompt_profile_by_session.get(active_session_id, st.session_state.default_prompt_profile)
+    if active_session_id
+    else st.session_state.default_prompt_profile
+)
+
+if active_session_id:
+    st.session_state.prompt_profile_by_session[active_session_id] = st.session_state.default_prompt_profile
+    active_prompt_profile = st.session_state.default_prompt_profile
 
 left_col, right_col = st.columns([2, 1])
 
@@ -100,6 +131,7 @@ with left_col:
 
     if active_user_name:
         st.caption(f"Sessao ativa: {active_user_name}")
+        st.caption(f"Perfil: {PROMPT_PROFILE_OPTIONS.get(active_prompt_profile, active_prompt_profile)}")
     else:
         st.info("Crie um novo chat na barra lateral para comecar.")
 
@@ -125,6 +157,7 @@ with left_col:
             "session_id": active_session_id,
             "user_id": "-".join(active_user_name.strip().lower().split()) or "user",
             "user_name": active_user_name,
+            "prompt_profile": active_prompt_profile,
         }
         status_placeholder = st.empty()
         try:
@@ -170,8 +203,9 @@ with left_col:
                             assistant_placeholder.markdown(f"{streamed_text}▌")
                     elif current_event == "done":
                         done_payload = event_payload
-                        streamed_text = str(done_payload.get("assistant_message", streamed_text))
-                        streamed_triplets = done_payload.get("extracted_triplets", [])
+                        done_data = done_payload
+                        streamed_text = str(done_data.get("assistant_message", streamed_text))
+                        streamed_triplets = done_data.get("extracted_triplets", [])
                         assistant_placeholder.markdown(streamed_text)
                     elif current_event == "error":
                         detail = str(event_payload.get("detail", "Erro no streaming do backend"))
@@ -189,6 +223,9 @@ with left_col:
 
             st.session_state.active_session_id = done_payload["session_id"]
             st.session_state.active_user_name = done_payload["user_name"]
+            st.session_state.prompt_profile_by_session[done_payload["session_id"]] = done_payload.get(
+                "prompt_profile", active_prompt_profile
+            )
 
             session_messages.append(
                 {

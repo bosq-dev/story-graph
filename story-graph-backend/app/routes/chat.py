@@ -27,15 +27,23 @@ def format_sse(event: str, payload: dict) -> str:
 def send_message(payload: ChatMessageRequest, services: AppServices = Depends(get_services)) -> ChatMessageResponse:
     session_id = services.chat_repo.ensure_session(payload.session_id, payload.user_id, payload.user_name)
 
+    history = services.chat_repo.get_history(session_id, limit=30)
     user_message_id = services.chat_repo.add_message(session_id, "user", payload.message)
     try:
-        triplets = services.llm_extractor.extract_triplets(payload.message, payload.user_name)
+        triplets = services.llm_extractor.extract_triplets(
+            payload.message, payload.user_name, payload.prompt_profile, history
+        )
         stored_triplets = services.graph_repo.upsert_triplets(
             triplets=triplets,
             source_message_id=str(user_message_id),
             source_message=payload.message,
         )
-        assistant_message = services.llm_extractor.build_assistant_reply(payload.message, payload.user_name)
+        assistant_message = services.llm_extractor.build_assistant_reply(
+            payload.message,
+            payload.user_name,
+            payload.prompt_profile,
+            history,
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
@@ -44,6 +52,7 @@ def send_message(payload: ChatMessageRequest, services: AppServices = Depends(ge
     return ChatMessageResponse(
         session_id=session_id,
         user_name=payload.user_name,
+        prompt_profile=payload.prompt_profile,
         assistant_message=assistant_message,
         extracted_triplets=triplets,
         stored_triplets_count=stored_triplets,
@@ -54,9 +63,12 @@ def send_message(payload: ChatMessageRequest, services: AppServices = Depends(ge
 def send_message_stream(payload: ChatMessageRequest, services: AppServices = Depends(get_services)) -> StreamingResponse:
     session_id = services.chat_repo.ensure_session(payload.session_id, payload.user_id, payload.user_name)
 
+    history = services.chat_repo.get_history(session_id, limit=30)
     user_message_id = services.chat_repo.add_message(session_id, "user", payload.message)
     try:
-        triplets = services.llm_extractor.extract_triplets(payload.message, payload.user_name)
+        triplets = services.llm_extractor.extract_triplets(
+            payload.message, payload.user_name, payload.prompt_profile, history
+        )
         stored_triplets = services.graph_repo.upsert_triplets(
             triplets=triplets,
             source_message_id=str(user_message_id),
@@ -68,7 +80,12 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
     def event_stream():
         collected_tokens: list[str] = []
         try:
-            for token in services.llm_extractor.stream_assistant_reply(payload.message, payload.user_name):
+            for token in services.llm_extractor.stream_assistant_reply(
+                payload.message,
+                payload.user_name,
+                payload.prompt_profile,
+                history,
+            ):
                 collected_tokens.append(token)
                 yield format_sse("token", {"text": token})
 
@@ -78,6 +95,7 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
             response_payload = ChatMessageResponse(
                 session_id=session_id,
                 user_name=payload.user_name,
+                prompt_profile=payload.prompt_profile,
                 assistant_message=assistant_message,
                 extracted_triplets=triplets,
                 stored_triplets_count=stored_triplets,

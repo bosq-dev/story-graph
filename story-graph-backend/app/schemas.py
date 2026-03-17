@@ -11,6 +11,7 @@ class ChatMessageRequest(BaseModel):
     session_id: str | None = None
     user_id: str = "user"
     user_name: str = Field(min_length=1, max_length=120, default="User")
+    prompt_profile: str = Field(min_length=1, max_length=80, default="hotel_customer_service")
 
 
 class Triplet(BaseModel):
@@ -41,6 +42,7 @@ class Triplet(BaseModel):
 class ChatMessageResponse(BaseModel):
     session_id: str
     user_name: str
+    prompt_profile: str
     assistant_message: str
     extracted_triplets: list[Triplet]
     stored_triplets_count: int
