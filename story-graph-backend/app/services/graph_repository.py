@@ -173,3 +173,19 @@ class GraphRepository:
 
     def close(self) -> None:
         self._driver.close()
+
+    def run_readonly_query(
+        self,
+        cypher: str,
+        params: dict | None = None,
+        row_limit: int = 200,
+    ) -> list[dict]:
+        safe_limit = max(1, min(int(row_limit), 500))
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, **(params or {}))  # type: ignore[arg-type]
+            rows: list[dict] = []
+            for index, record in enumerate(result):
+                if index >= safe_limit:
+                    break
+                rows.append(record.data())
+            return rows

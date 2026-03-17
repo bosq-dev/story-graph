@@ -1,11 +1,15 @@
 import json
+import logging
 import re
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from openai import OpenAI
 
 from app.config import ALLOWED_ENTITY_TYPES
 from app.schemas import Triplet
+
+
+logger = logging.getLogger(__name__)
 
 
 EXTRACTION_PROMPT = """
@@ -120,7 +124,80 @@ PROMPT_PROFILES: dict[str, dict[str, str]] = {
             "Focus on incident reports, blocked workflows, integration requests, subscription changes and feature requests."
         ),
     },
+    "graph_admin_assistant": {
+        "label": "Graph Admin Assistant",
+        "assistant": (
+            "You are an internal graph analyst assistant. Prefer structured tools first. "
+            "When using free-form Cypher, keep it read-only, explicit and concise. "
+            "Never claim data that was not returned by tools."
+        ),
+        "extraction": (
+            "Admin mode does not extract triplets."
+        ),
+    },
 }
+
+ADMIN_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "find_entity",
+            "description": "Find entities by partial name and optional type.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "entity_type": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "neighbors",
+            "description": "Get neighbors of one entity with depth 1 or 2.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity_name": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 2},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+                "required": ["entity_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recent_relations",
+            "description": "Return most recent relations added/updated in graph.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_graph_query",
+            "description": "Run a read-only Cypher query with strict validation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cypher": {"type": "string"},
+                    "params": {"type": "object"},
+                },
+                "required": ["cypher"],
+            },
+        },
+    },
+]
 
 
 class LLMExtractor:
@@ -266,6 +343,132 @@ class LLMExtractor:
                 return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
 
         return []
+
+    def run_admin_assistant_with_tools(
+        self,
+        message: str,
+        user_name: str,
+        history: list[dict] | None,
+        tool_executor: Callable[[str, dict[str, Any]], Any],
+        max_tool_rounds: int = 4,
+    ) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": self._assistant_system_prompt(
+                    user_name=user_name,
+                    prompt_profile="graph_admin_assistant",
+                ),
+            },
+            {
+                "role": "system",
+                "content": (
+                    "Use tools to answer graph questions. "
+                    "If the user asks about relationships, call tools before answering."
+                ),
+            },
+        ]
+
+        for h in (history or [])[-20:]:
+            messages.append({"role": h["role"], "content": h["content"]})
+        messages.append({"role": "user", "content": message})
+
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+
+        for _ in range(max_tool_rounds):
+            try:
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=0.1,
+                    messages=messages,  # type: ignore[arg-type]
+                    tools=ADMIN_TOOL_DEFINITIONS,  # type: ignore[arg-type]
+                    tool_choice="auto",
+                )
+            except Exception as exc:
+                return {
+                    "assistant_message": (
+                        "Nao consegui usar as tools de grafo com o provedor atual. "
+                        "Verifique suporte a function-calling/ferramentas no modelo configurado."
+                    ),
+                    "tool_calls": [],
+                    "tool_results": [
+                        {
+                            "tool_name": "tool_runtime",
+                            "ok": False,
+                            "result": {"error": str(exc)},
+                            "duration_ms": 0,
+                        }
+                    ],
+                }
+            response_message = completion.choices[0].message
+            response_content = response_message.content or ""
+
+            if not response_message.tool_calls:
+                final_message = response_content.strip() or "Nao encontrei dados no grafo para responder com seguranca."
+                return {
+                    "assistant_message": final_message,
+                    "tool_calls": tool_calls,
+                    "tool_results": tool_results,
+                }
+
+            tool_calls_payload: list[dict[str, Any]] = []
+            tool_results_payload: list[tuple[str, dict[str, Any]]] = []
+            for tc in response_message.tool_calls:
+                function_payload = getattr(tc, "function", None)
+                if function_payload is None:
+                    continue
+
+                function_name = str(getattr(function_payload, "name", "")).strip()
+                if not function_name:
+                    continue
+
+                raw_args = str(getattr(function_payload, "arguments", "{}") or "{}")
+                parsed_args = self._safe_parse_tool_args(raw_args)
+                tool_calls_payload.append(
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "arguments": raw_args,
+                        },
+                    }
+                )
+                tool_calls.append({"tool_name": function_name, "arguments": parsed_args})
+
+                tool_result = tool_executor(function_name, parsed_args)
+                if hasattr(tool_result, "__dict__"):
+                    result_payload = dict(tool_result.__dict__)
+                elif isinstance(tool_result, dict):
+                    result_payload = tool_result
+                else:
+                    result_payload = {
+                        "tool_name": function_name,
+                        "ok": False,
+                        "result": {"error": "Invalid tool result."},
+                        "duration_ms": 0,
+                    }
+                tool_results.append(result_payload)
+                tool_results_payload.append((tc.id, result_payload))
+
+            # Preserve provider-specific fields from the original assistant message
+            # (e.g. Gemini thought signatures required for subsequent tool turns).
+            messages.append(response_message.model_dump(exclude_none=True))
+            for tool_call_id, result_payload in tool_results_payload:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": json.dumps(result_payload.get("result", {}), ensure_ascii=False),
+                    }
+                )
+
+        return {
+            "assistant_message": "A consulta exigiu muitas iteracoes de ferramenta. Tente refinar a pergunta.",
+            "tool_calls": tool_calls,
+            "tool_results": tool_results,
+        }
 
     def _from_entity_graph(self, payload: dict[str, Any]) -> list[Triplet]:
         entities_raw = payload.get("entities", [])
@@ -502,3 +705,13 @@ class LLMExtractor:
                 pass
 
         return {"triplets": []}
+
+    @staticmethod
+    def _safe_parse_tool_args(raw: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return {}
+        return {}

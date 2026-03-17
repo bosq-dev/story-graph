@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+from app.routes.admin_chat import router as admin_chat_router
 from app.routes.chat import router as chat_router
 from app.routes.graph import router as graph_router
 from app.services.chat_repository import ChatRepository
@@ -53,6 +54,7 @@ app.add_middleware(
 
 app.include_router(chat_router)
 app.include_router(graph_router)
+app.include_router(admin_chat_router)
 
 
 @app.get("/health")

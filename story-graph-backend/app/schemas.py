@@ -93,3 +93,30 @@ class GraphRecentItem(BaseModel):
     object: str
     source_message_id: str | None = None
     updated_at: str | None = None
+
+
+class AdminChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    session_id: str | None = None
+    user_id: str = "admin"
+    user_name: str = Field(min_length=1, max_length=120, default="Admin")
+
+
+class AdminToolCall(BaseModel):
+    tool_name: str
+    arguments: dict
+
+
+class AdminToolResult(BaseModel):
+    tool_name: str
+    ok: bool
+    result: list[dict] | dict
+    duration_ms: int
+
+
+class AdminChatResponse(BaseModel):
+    session_id: str
+    user_name: str
+    assistant_message: str
+    tool_calls: list[AdminToolCall]
+    tool_results: list[AdminToolResult]
