@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, Iterator
 
 from openai import OpenAI
 
@@ -60,6 +60,31 @@ class LLMExtractor:
         )
         content = completion.choices[0].message.content or ""
         return content.strip() or "Posso ajudar a detalhar isso melhor se quiser."
+
+    def stream_assistant_reply(self, message: str, user_name: str) -> Iterator[str]:
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            temperature=0.4,
+            stream=True,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a concise assistant for product and engineering conversations. "
+                        f"The current speaker is named {user_name}."
+                    ),
+                },
+                {"role": "user", "content": message},
+            ],
+        )
+
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = delta.content if delta else None
+            if content:
+                yield content
 
     def extract_triplets(self, message: str, user_name: str) -> list[Triplet]:
         extraction_request = (

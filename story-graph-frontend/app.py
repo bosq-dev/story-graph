@@ -1,4 +1,5 @@
 import os
+import json
 
 import requests
 import streamlit as st
@@ -39,6 +40,8 @@ if "entities" not in st.session_state:
     st.session_state.entities = []
 if "relations" not in st.session_state:
     st.session_state.relations = []
+if "is_sending" not in st.session_state:
+    st.session_state.is_sending = False
 
 with st.sidebar:
     st.header("Chats")
@@ -111,8 +114,9 @@ with left_col:
                         f"{t['subject']}, {t['relation']}, {t['object']}, {t['object_type']} (conf={t['confidence']:.2f})"
                     )
 
-    prompt = st.chat_input("Digite sua mensagem", disabled=active_session_id is None)
+    prompt = st.chat_input("Digite sua mensagem", disabled=active_session_id is None or st.session_state.is_sending)
     if prompt and active_session_id and active_user_name:
+        st.session_state.is_sending = True
         session_messages = st.session_state.messages_by_session.setdefault(active_session_id, [])
         session_messages.append({"role": "user", "content": prompt})
 
@@ -122,24 +126,91 @@ with left_col:
             "user_id": "-".join(active_user_name.strip().lower().split()) or "user",
             "user_name": active_user_name,
         }
+        status_placeholder = st.empty()
         try:
-            response = requests.post(f"{BACKEND_URL}/chat/message", json=payload, timeout=40)
+            status_placeholder.info("Gerando resposta...")
+            response = requests.post(
+                f"{BACKEND_URL}/chat/message/stream",
+                json=payload,
+                headers={"Accept": "text/event-stream"},
+                stream=True,
+                timeout=(5, 180),
+            )
             response.raise_for_status()
-            data = response.json()
+            done_payload: dict | None = None
+            streamed_text = ""
+            streamed_triplets = []
+            current_event = "message"
+            with st.chat_message("assistant"):
+                assistant_placeholder = st.empty()
+                for line in response.iter_lines(decode_unicode=True):
+                    if line is None:
+                        continue
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
 
-            st.session_state.active_session_id = data["session_id"]
-            st.session_state.active_user_name = data["user_name"]
+                    if stripped.startswith("event:"):
+                        current_event = stripped.split(":", 1)[1].strip()
+                        continue
+
+                    if not stripped.startswith("data:"):
+                        continue
+
+                    data_text = stripped.split(":", 1)[1].strip()
+                    try:
+                        event_payload = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if current_event == "token":
+                        token = str(event_payload.get("text", ""))
+                        if token:
+                            streamed_text += token
+                            assistant_placeholder.markdown(f"{streamed_text}▌")
+                    elif current_event == "done":
+                        done_payload = event_payload
+                        streamed_text = str(done_payload.get("assistant_message", streamed_text))
+                        streamed_triplets = done_payload.get("extracted_triplets", [])
+                        assistant_placeholder.markdown(streamed_text)
+                    elif current_event == "error":
+                        detail = str(event_payload.get("detail", "Erro no streaming do backend"))
+                        raise requests.RequestException(detail)
+
+                if done_payload is None:
+                    raise requests.RequestException("Fluxo SSE terminou sem evento final 'done'.")
+
+                if streamed_triplets:
+                    st.caption("Triplas extraidas nesta mensagem:")
+                    for t in streamed_triplets:
+                        st.code(
+                            f"{t['subject']}, {t['relation']}, {t['object']}, {t['object_type']} (conf={t['confidence']:.2f})"
+                        )
+
+            st.session_state.active_session_id = done_payload["session_id"]
+            st.session_state.active_user_name = done_payload["user_name"]
+
             session_messages.append(
                 {
                     "role": "assistant",
-                    "content": data["assistant_message"],
-                    "triplets": data.get("extracted_triplets", []),
+                    "content": streamed_text,
+                    "triplets": streamed_triplets,
                 }
             )
             st.session_state.sessions = fetch_sessions()
+            status_placeholder.empty()
             st.rerun()
+        except requests.Timeout:
+            status_placeholder.empty()
+            st.warning(
+                "O backend demorou para responder e a requisicao expirou. "
+                "Tente novamente em alguns segundos."
+            )
         except requests.RequestException as exc:
+            status_placeholder.empty()
             st.error(f"Falha ao chamar backend: {exc}")
+        finally:
+            st.session_state.is_sending = False
 
 with right_col:
     st.subheader("Grafo")
