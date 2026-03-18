@@ -25,10 +25,11 @@ async def lifespan(app: FastAPI):
         database=settings.neo4j_database,
     )
     llm_extractor = LLMExtractor(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-        model=settings.openai_model,
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
+        model=settings.llm_model,
         default_confidence=settings.extraction_confidence_default,
+        provider=settings.llm_provider,
     )
 
     app.state.services = AppServices(

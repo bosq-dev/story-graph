@@ -3,10 +3,9 @@ import logging
 import re
 from typing import Any, Callable, Iterator
 
-from openai import OpenAI
-
 from app.config import ALLOWED_ENTITY_TYPES
 from app.schemas import Triplet
+from app.services.llm_client import LiteLLMClient
 
 
 logger = logging.getLogger(__name__)
@@ -212,9 +211,15 @@ ADMIN_TOOL_DEFINITIONS: list[dict[str, Any]] = [
 
 
 class LLMExtractor:
-    def __init__(self, api_key: str, base_url: str, model: str, default_confidence: float) -> None:
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        default_confidence: float,
+        provider: str | None = None,
+    ) -> None:
+        self.client = LiteLLMClient(api_key=api_key, base_url=base_url, model=model, provider=provider)
         self.default_confidence = default_confidence
 
     @staticmethod
@@ -253,12 +258,12 @@ class LLMExtractor:
         for h in (history or [])[-20:]:
             messages.append({"role": h["role"], "content": h["content"]})
         messages.append({"role": "user", "content": message})
-        completion = self.client.chat.completions.create(
-            model=self.model,
+        completion = self.client.create(
             temperature=0.4,
             messages=messages,
         )
-        content = completion.choices[0].message.content or ""
+        response_message = self._get_choice_message(completion)
+        content = self._message_content(response_message)
         return content.strip() or "Posso ajudar a detalhar isso melhor se quiser."
 
     def stream_assistant_reply(
@@ -277,18 +282,14 @@ class LLMExtractor:
         for h in (history or [])[-20:]:
             messages.append({"role": h["role"], "content": h["content"]})
         messages.append({"role": "user", "content": message})
-        stream = self.client.chat.completions.create(
-            model=self.model,
+        stream = self.client.create(
             temperature=0.4,
             stream=True,
             messages=messages,
         )
 
         for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            content = delta.content if delta else None
+            content = self._chunk_content(chunk)
             if content:
                 yield content
 
@@ -315,8 +316,7 @@ class LLMExtractor:
             f"Conversation:\n{conversation_text}"
         )
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
+            completion = self.client.create(
                 temperature=0,
                 response_format={"type": "json_object"},
                 messages=[
@@ -326,8 +326,7 @@ class LLMExtractor:
                 ],
             )
         except Exception:
-            completion = self.client.chat.completions.create(
-                model=self.model,
+            completion = self.client.create(
                 temperature=0,
                 messages=[
                     {"role": "system", "content": EXTRACTION_PROMPT},
@@ -335,7 +334,8 @@ class LLMExtractor:
                     {"role": "user", "content": extraction_request},
                 ],
             )
-        raw = completion.choices[0].message.content or "{}"
+        response_message = self._get_choice_message(completion)
+        raw = self._message_content(response_message) or "{}"
         parsed = self._safe_parse_json(raw)
         if isinstance(parsed, dict):
             triplets = self._from_entity_graph(parsed)
@@ -394,8 +394,7 @@ class LLMExtractor:
 
         for _ in range(max_tool_rounds):
             try:
-                completion = self.client.chat.completions.create(
-                    model=self.model,
+                completion = self.client.create(
                     temperature=0.1,
                     messages=messages,  # type: ignore[arg-type]
                     tools=ADMIN_TOOL_DEFINITIONS,  # type: ignore[arg-type]
@@ -417,10 +416,11 @@ class LLMExtractor:
                         }
                     ],
                 }
-            response_message = completion.choices[0].message
-            response_content = response_message.content or ""
+            response_message = self._get_choice_message(completion)
+            response_content = self._message_content(response_message)
+            response_tool_calls = self._message_tool_calls(response_message)
 
-            if not response_message.tool_calls:
+            if not response_tool_calls:
                 final_message = response_content.strip() or "Nao encontrei dados no grafo para responder com seguranca."
                 return {
                     "assistant_message": final_message,
@@ -428,29 +428,31 @@ class LLMExtractor:
                     "tool_results": tool_results,
                 }
 
-            tool_calls_payload: list[dict[str, Any]] = []
             tool_results_payload: list[tuple[str, dict[str, Any]]] = []
-            for tc in response_message.tool_calls:
-                function_payload = getattr(tc, "function", None)
-                if function_payload is None:
+            for tc in response_tool_calls:
+                function_payload: Any = None
+                tool_call_id = ""
+                if isinstance(tc, dict):
+                    function_payload = tc.get("function")
+                    tool_call_id = str(tc.get("id", "")).strip()
+                else:
+                    function_payload = getattr(tc, "function", None)
+                    tool_call_id = str(getattr(tc, "id", "")).strip()
+
+                if function_payload is None or not tool_call_id:
                     continue
 
-                function_name = str(getattr(function_payload, "name", "")).strip()
+                if isinstance(function_payload, dict):
+                    function_name = str(function_payload.get("name", "")).strip()
+                    raw_args = str(function_payload.get("arguments", "{}") or "{}")
+                else:
+                    function_name = str(getattr(function_payload, "name", "")).strip()
+                    raw_args = str(getattr(function_payload, "arguments", "{}") or "{}")
+
                 if not function_name:
                     continue
 
-                raw_args = str(getattr(function_payload, "arguments", "{}") or "{}")
                 parsed_args = self._safe_parse_tool_args(raw_args)
-                tool_calls_payload.append(
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": function_name,
-                            "arguments": raw_args,
-                        },
-                    }
-                )
                 tool_calls.append({"tool_name": function_name, "arguments": parsed_args})
 
                 tool_result = tool_executor(function_name, parsed_args)
@@ -466,11 +468,12 @@ class LLMExtractor:
                         "duration_ms": 0,
                     }
                 tool_results.append(result_payload)
-                tool_results_payload.append((tc.id, result_payload))
+                tool_results_payload.append((tool_call_id, result_payload))
 
             # Preserve provider-specific fields from the original assistant message
             # (e.g. Gemini thought signatures required for subsequent tool turns).
-            messages.append(response_message.model_dump(exclude_none=True))
+            response_message_dump = self._message_dump(response_message)
+            messages.append(response_message_dump)
             for tool_call_id, result_payload in tool_results_payload:
                 messages.append(
                     {
@@ -491,12 +494,12 @@ class LLMExtractor:
             }
         )
         try:
-            final_completion = self.client.chat.completions.create(
-                model=self.model,
+            final_completion = self.client.create(
                 temperature=0.1,
                 messages=messages,  # type: ignore[arg-type]
             )
-            final_message = (final_completion.choices[0].message.content or "").strip()
+            final_response_message = self._get_choice_message(final_completion)
+            final_message = self._message_content(final_response_message).strip()
         except Exception:
             final_message = ""
 
@@ -757,3 +760,75 @@ class LLMExtractor:
         except json.JSONDecodeError:
             return {}
         return {}
+
+    @staticmethod
+    def _get_choice_message(completion: Any) -> Any:
+        choices = getattr(completion, "choices", None)
+        if choices and isinstance(choices, list):
+            message = getattr(choices[0], "message", None)
+            if message is not None:
+                return message
+            if isinstance(choices[0], dict):
+                return choices[0].get("message") or {}
+
+        if isinstance(completion, dict):
+            dict_choices = completion.get("choices")
+            if isinstance(dict_choices, list) and dict_choices:
+                choice0 = dict_choices[0]
+                if isinstance(choice0, dict):
+                    return choice0.get("message") or {}
+        return {}
+
+    @staticmethod
+    def _message_content(message: Any) -> str:
+        if isinstance(message, dict):
+            content = message.get("content", "")
+            return str(content or "")
+        return str(getattr(message, "content", "") or "")
+
+    @staticmethod
+    def _message_tool_calls(message: Any) -> list[Any]:
+        if isinstance(message, dict):
+            tool_calls = message.get("tool_calls", [])
+            return tool_calls if isinstance(tool_calls, list) else []
+
+        tool_calls = getattr(message, "tool_calls", [])
+        return tool_calls if isinstance(tool_calls, list) else []
+
+    @staticmethod
+    def _message_dump(message: Any) -> dict[str, Any]:
+        if hasattr(message, "model_dump"):
+            dumped = message.model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+        if isinstance(message, dict):
+            return message
+        return {"role": "assistant", "content": str(getattr(message, "content", "") or "")}
+
+    @staticmethod
+    def _chunk_content(chunk: Any) -> str | None:
+        choices = getattr(chunk, "choices", None)
+        if choices and isinstance(choices, list):
+            delta = getattr(choices[0], "delta", None)
+            if delta is not None:
+                content = getattr(delta, "content", None)
+                if content:
+                    return str(content)
+            if isinstance(choices[0], dict):
+                dict_delta = choices[0].get("delta", {})
+                if isinstance(dict_delta, dict):
+                    content = dict_delta.get("content")
+                    if content:
+                        return str(content)
+
+        if isinstance(chunk, dict):
+            dict_choices = chunk.get("choices")
+            if isinstance(dict_choices, list) and dict_choices:
+                choice0 = dict_choices[0]
+                if isinstance(choice0, dict):
+                    dict_delta = choice0.get("delta", {})
+                    if isinstance(dict_delta, dict):
+                        content = dict_delta.get("content")
+                        if content:
+                            return str(content)
+        return None
