@@ -1,11 +1,17 @@
-import json
 import logging
-import re
+from dataclasses import dataclass
 from typing import Any, Callable, Iterator
+
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.config import ALLOWED_ENTITY_TYPES
 from app.schemas import Triplet
-from app.services.llm_client import LiteLLMClient
+from app.services.admin_graph_tools import AdminGraphTools, ToolExecution
 
 
 logger = logging.getLogger(__name__)
@@ -36,29 +42,29 @@ Preferred shape:
 Also accepted for each triplet item: direct fields
 {"subject":"...", "subject_type":"...", "relation":"...", "object":"...", "object_type":"...", "confidence":0.9}
 
-CRITICAL — graph-first extraction:
+CRITICAL - graph-first extraction:
 - Your primary responsibility in this system is to populate the graph. If there is any complaint, request,
   or concrete reference (order, room, product, issue), you MUST emit entities and triplets now.
 - Extract entities immediately from PARTIAL information. Do NOT wait for complete data.
-  Example: "Pedido 1234" alone → create entity {"id":"e1","name":"Pedido 1234","entity_type":"Product"}
-  Example: "tamanho errado" alone → create entity {"id":"e2","name":"tamanho errado","entity_type":"Issue"}
+  Example: "Pedido 1234" alone -> create entity {"id":"e1","name":"Pedido 1234","entity_type":"Product"}
+  Example: "tamanho errado" alone -> create entity {"id":"e2","name":"tamanho errado","entity_type":"Issue"}
 - An order/ticket reference ("pedido 1234", "order #5", "ticket 99") is ALWAYS sufficient to create a Product entity.
 - A complaint or problem is ALWAYS sufficient to create an Issue entity.
-- An action request (troca, devolução, reembolso, cancelamento, limpeza) is ALWAYS an Activity entity.
-- You receive the FULL recent conversation — extract ALL entities and relations visible across all turns,
+- An action request (troca, devolucao, reembolso, cancelamento, limpeza) is ALWAYS an Activity entity.
+- You receive the FULL recent conversation - extract ALL entities and relations visible across all turns,
   not just the last message. Combine information from different turns into one graph.
 - Reuse the same entity id when the text refers to the same real-world entity.
 - Do not create duplicate entities with different types for the same thing.
 - Keep relations short and normalized in snake_case: reported_issue, requested_action, has_issue,
   affects_order, affects_location, resolved_by, blocked_by, requested_refund, mentions_product.
 - entity_type rules:
-    Order / Pedido / Ticket → Product
-    Concrete complaint / bug / defect → Issue
-    Action request (troca, refund, fix, cancel) → Activity
-    Person / customer → User
-    Brand / store / company → Company
-    Physical space (quarto, andar, loja) → Location
-    Specific item / SKU → Product
+    Order / Pedido / Ticket -> Product
+    Concrete complaint / bug / defect -> Issue
+    Action request (troca, refund, fix, cancel) -> Activity
+    Person / customer -> User
+    Brand / store / company -> Company
+    Physical space (quarto, andar, loja) -> Location
+    Specific item / SKU -> Product
 - If truly no extractable information exists, return {"entities": [], "triplets": []}
 - Never add fields outside the schema.
 """.strip()
@@ -74,7 +80,7 @@ Goals:
 Critical rules:
 - In this demo, the effective action is to register facts into the knowledge graph.
     So after acknowledging, prioritize concise resolution guidance and avoid long interrogation loops.
-- You receive the FULL recent conversation history. Use it — never ask for information the customer already provided.
+- You receive the FULL recent conversation history. Use it - never ask for information the customer already provided.
 - Ask at most ONE follow-up question per response. If multiple pieces of info are missing, ask only for the most important one.
 - When you already know the order number / issue / request from history, do NOT ask for it again.
 
@@ -89,15 +95,15 @@ PROMPT_PROFILES: dict[str, dict[str, str]] = {
         "label": "Hotel Customer Service",
         "assistant": (
             "You are assisting hotel guests with reservations, room issues, amenities and incident handling. "
-                "Prioritize empathy, quick triage, and immediate resolution options. "
-                "If the guest reports a room problem (e.g., bad smell, noise, cleanliness), treat it as a concrete issue "
-                "already logged and avoid repeatedly asking for the same details."
+            "Prioritize empathy, quick triage, and immediate resolution options. "
+            "If the guest reports a room problem (e.g., bad smell, noise, cleanliness), treat it as a concrete issue "
+            "already logged and avoid repeatedly asking for the same details."
         ),
         "extraction": (
             "Focus on complaints about room conditions, housekeeping delays, check-in/check-out issues, noise, "
-                "billing and refund requests. Always create a Location entity for room references (e.g., 'quarto 2'). "
-                "Always create an Issue entity for room complaints (e.g., smell, dirt, noise). "
-                "Link User -> reported_issue -> Issue and Issue -> affects_location -> Location whenever applicable."
+            "billing and refund requests. Always create a Location entity for room references (e.g., 'quarto 2'). "
+            "Always create an Issue entity for room complaints (e.g., smell, dirt, noise). "
+            "Link User -> reported_issue -> Issue and Issue -> affects_location -> Location whenever applicable."
         ),
     },
     "ecommerce_support": {
@@ -108,10 +114,10 @@ PROMPT_PROFILES: dict[str, dict[str, str]] = {
         ),
         "extraction": (
             "Domain: e-commerce. "
-            "Always create a Product entity for any order reference (e.g. 'Pedido 1234' → entity_type Product). "
+            "Always create a Product entity for any order reference (e.g. 'Pedido 1234' -> entity_type Product). "
             "Always create an Issue entity for wrong items, wrong size, damaged goods, missing items, late delivery. "
             "Always create an Activity entity for exchange, return, refund or cancellation requests. "
-            "Link User → reported_issue → Issue, Issue → affects_order → Order, User → requested_action → Activity."
+            "Link User -> reported_issue -> Issue, Issue -> affects_order -> Order, User -> requested_action -> Activity."
         ),
     },
     "saas_support": {
@@ -130,84 +136,39 @@ PROMPT_PROFILES: dict[str, dict[str, str]] = {
             "When using free-form Cypher, keep it read-only, explicit and concise. "
             "Never claim data that was not returned by tools."
         ),
-        "extraction": (
-            "Admin mode does not extract triplets."
-        ),
+        "extraction": ("Admin mode does not extract triplets."),
     },
 }
 
-ADMIN_TOOL_DEFINITIONS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "describe_graph_schema",
-            "description": "Inspect current graph vocabulary: labels, relationship types, entity_types, relation_types and sample entities.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "find_entity",
-            "description": "Find entities by partial name and optional type.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "entity_type": {"type": "string"},
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "neighbors",
-            "description": "Get neighbors of one entity with depth 1 or 2.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "entity_name": {"type": "string"},
-                    "depth": {"type": "integer", "minimum": 1, "maximum": 2},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-                },
-                "required": ["entity_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "recent_relations",
-            "description": "Return most recent relations added/updated in graph.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_graph_query",
-            "description": "Run a read-only Cypher query with strict validation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cypher": {"type": "string"},
-                    "params": {"type": "object"},
-                },
-                "required": ["cypher"],
-            },
-        },
-    },
-]
+
+class ExtractedEntity(BaseModel):
+    id: str | None = None
+    name: str
+    entity_type: str = "Concept"
+
+
+class ExtractedTriplet(BaseModel):
+    subject_id: str | None = None
+    relation: str
+    object_id: str | None = None
+    confidence: float | None = None
+    subject: str | None = None
+    subject_type: str | None = None
+    object: str | None = None
+    object_type: str | None = None
+
+
+class ExtractionOutput(BaseModel):
+    entities: list[ExtractedEntity] = Field(default_factory=list)
+    triplets: list[ExtractedTriplet] = Field(default_factory=list)
+
+
+@dataclass
+class AdminAgentDeps:
+    graph_tools: AdminGraphTools
+    tool_calls: list[dict[str, Any]]
+    tool_results: list[dict[str, Any]]
+    max_tool_rounds: int
 
 
 class LLMExtractor:
@@ -219,8 +180,13 @@ class LLMExtractor:
         default_confidence: float,
         provider: str | None = None,
     ) -> None:
-        self.client = LiteLLMClient(api_key=api_key, base_url=base_url, model=model, provider=provider)
         self.default_confidence = default_confidence
+        self.model = self._build_model(api_key=api_key, base_url=base_url, model=model, provider=provider)
+
+        self.assistant_agent = Agent(self.model)
+        self.extraction_agent = Agent(self.model, output_type=ExtractionOutput)
+        self.admin_agent: Agent[AdminAgentDeps, str] = Agent(self.model, deps_type=AdminAgentDeps)
+        self._register_admin_tools()
 
     @staticmethod
     def resolve_prompt_profile(prompt_profile: str | None) -> str:
@@ -249,22 +215,14 @@ class LLMExtractor:
         prompt_profile: str,
         history: list[dict] | None = None,
     ) -> str:
-        messages: list[Any] = [
-            {
-                "role": "system",
-                "content": self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile),
-            }
-        ]
-        for h in (history or [])[-20:]:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": message})
-        completion = self.client.create(
-            temperature=0.4,
-            messages=messages,
+        prompt = self._conversation_prompt(message=message, history=history)
+        result = self.assistant_agent.run_sync(
+            prompt,
+            instructions=[self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile)],
+            model_settings={"temperature": 0.4},
         )
-        response_message = self._get_choice_message(completion)
-        content = self._message_content(response_message)
-        return content.strip() or "Posso ajudar a detalhar isso melhor se quiser."
+        reply = str(result.output).strip()
+        return reply or "Posso ajudar a detalhar isso melhor se quiser."
 
     def stream_assistant_reply(
         self,
@@ -273,25 +231,17 @@ class LLMExtractor:
         prompt_profile: str,
         history: list[dict] | None = None,
     ) -> Iterator[str]:
-        messages: list[Any] = [
-            {
-                "role": "system",
-                "content": self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile),
-            }
-        ]
-        for h in (history or [])[-20:]:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": message})
-        stream = self.client.create(
-            temperature=0.4,
-            stream=True,
-            messages=messages,
+        prompt = self._conversation_prompt(message=message, history=history)
+        # NOTE: run_stream_sync in this pydantic-ai version does not accept `instructions`.
+        # Build a scoped agent with a dynamic system prompt for this request.
+        scoped_stream_agent = Agent(self.model, system_prompt=self._assistant_system_prompt(user_name, prompt_profile))
+        stream = scoped_stream_agent.run_stream_sync(
+            prompt,
+            model_settings={"temperature": 0.4},
         )
-
-        for chunk in stream:
-            content = self._chunk_content(chunk)
-            if content:
-                yield content
+        for token in stream.stream_text(delta=True):
+            if token:
+                yield token
 
     def extract_triplets(
         self,
@@ -300,220 +250,205 @@ class LLMExtractor:
         prompt_profile: str,
         history: list[dict] | None = None,
     ) -> list[Triplet]:
-        # Build conversation context from history + current message
-        history_lines = [
-            f"{h['role'].upper()}: {h['content']}"
-            for h in (history or [])[-20:]
-        ]
-        history_lines.append(f"USER: {message}")
-        conversation_text = "\n".join(history_lines)
-
         extraction_request = (
             f"The customer's real name is {user_name}. When the speaker refers to themselves, use the same "
             f"single entity named {user_name} with entity_type User. "
             "Extract ALL entities and relations visible in the full conversation below. "
-            'Return a JSON object with keys "entities" and "triplets" only.\n\n'
-            f"Conversation:\n{conversation_text}"
+            "Return a JSON object with keys 'entities' and 'triplets' only.\n\n"
+            f"{self._conversation_prompt(message=message, history=history)}"
         )
+
         try:
-            completion = self.client.create(
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": EXTRACTION_PROMPT},
-                    {"role": "system", "content": self._extraction_system_prompt(prompt_profile)},
-                    {"role": "user", "content": extraction_request},
-                ],
+            result = self.extraction_agent.run_sync(
+                extraction_request,
+                instructions=[EXTRACTION_PROMPT, self._extraction_system_prompt(prompt_profile)],
+                model_settings={"temperature": 0},
             )
         except Exception:
-            completion = self.client.create(
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": EXTRACTION_PROMPT},
-                    {"role": "system", "content": self._extraction_system_prompt(prompt_profile)},
-                    {"role": "user", "content": extraction_request},
-                ],
-            )
-        response_message = self._get_choice_message(completion)
-        raw = self._message_content(response_message) or "{}"
-        parsed = self._safe_parse_json(raw)
-        if isinstance(parsed, dict):
-            triplets = self._from_entity_graph(parsed)
-            if triplets:
-                return self._apply_speaker_name(self._reconcile_entity_types(triplets), user_name)
+            logger.exception("triplet_extraction_failed")
+            return []
 
-            items = parsed.get("triplets", [])
-            if isinstance(items, list):
-                legacy = self._from_legacy_triplets(items)
-                if legacy:
-                    return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
-
-        if isinstance(parsed, list):
-            legacy = self._from_legacy_triplets(parsed)
-            if legacy:
-                return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
-
-        return []
+        parsed = result.output.model_dump(mode="python")
+        triplets = self._from_entity_graph(parsed)
+        if not triplets:
+            return []
+        return self._apply_speaker_name(self._reconcile_entity_types(triplets), user_name)
 
     def run_admin_assistant_with_tools(
         self,
         message: str,
         user_name: str,
         history: list[dict] | None,
-        tool_executor: Callable[[str, dict[str, Any]], Any],
+        graph_tools: AdminGraphTools,
         max_tool_rounds: int = 6,
     ) -> dict[str, Any]:
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": self._assistant_system_prompt(
-                    user_name=user_name,
-                    prompt_profile="graph_admin_assistant",
-                ),
-            },
-            {
-                "role": "system",
-                "content": (
-                    "Use tools to answer graph questions. "
-                    "Playbook: call describe_graph_schema before free-form Cypher; "
-                    "prefer canonical graph model discovered from schema; "
-                    "use find_entity/neighbors for targeted exploration; "
-                    "use run_graph_query only after aligning labels/properties with discovered schema; "
-                    "if query fails with unknown label/property/relationship, refresh schema and retry with corrected Cypher; "
-                    "never invent labels like Quarto/Problema/TEM_PROBLEMA unless schema confirms them."
-                ),
-            },
+        deps = AdminAgentDeps(
+            graph_tools=graph_tools,
+            tool_calls=[],
+            tool_results=[],
+            max_tool_rounds=max_tool_rounds,
+        )
+        prompt = self._conversation_prompt(message=message, history=history)
+
+        instructions = [
+            self._assistant_system_prompt(user_name=user_name, prompt_profile="graph_admin_assistant"),
+            (
+                "Use tools to answer graph questions. "
+                "Playbook: call describe_graph_schema before free-form Cypher; "
+                "prefer canonical graph model discovered from schema; "
+                "use find_entity/neighbors for targeted exploration; "
+                "use run_graph_query only after aligning labels/properties with discovered schema; "
+                "if query fails with unknown label/property/relationship, refresh schema and retry with corrected Cypher; "
+                "never invent labels like Quarto/Problema/TEM_PROBLEMA unless schema confirms them. "
+                f"Never call tools more than {max_tool_rounds} times."
+            ),
         ]
 
-        for h in (history or [])[-20:]:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": message})
-
-        tool_calls: list[dict[str, Any]] = []
-        tool_results: list[dict[str, Any]] = []
-
-        for _ in range(max_tool_rounds):
-            try:
-                completion = self.client.create(
-                    temperature=0.1,
-                    messages=messages,  # type: ignore[arg-type]
-                    tools=ADMIN_TOOL_DEFINITIONS,  # type: ignore[arg-type]
-                    tool_choice="auto",
-                )
-            except Exception as exc:
-                return {
-                    "assistant_message": (
-                        "Nao consegui usar as tools de grafo com o provedor atual. "
-                        "Verifique suporte a function-calling/ferramentas no modelo configurado."
-                    ),
-                    "tool_calls": [],
-                    "tool_results": [
-                        {
-                            "tool_name": "tool_runtime",
-                            "ok": False,
-                            "result": {"error": str(exc)},
-                            "duration_ms": 0,
-                        }
-                    ],
-                }
-            response_message = self._get_choice_message(completion)
-            response_content = self._message_content(response_message)
-            response_tool_calls = self._message_tool_calls(response_message)
-
-            if not response_tool_calls:
-                final_message = response_content.strip() or "Nao encontrei dados no grafo para responder com seguranca."
-                return {
-                    "assistant_message": final_message,
-                    "tool_calls": tool_calls,
-                    "tool_results": tool_results,
-                }
-
-            tool_results_payload: list[tuple[str, dict[str, Any]]] = []
-            for tc in response_tool_calls:
-                function_payload: Any = None
-                tool_call_id = ""
-                if isinstance(tc, dict):
-                    function_payload = tc.get("function")
-                    tool_call_id = str(tc.get("id", "")).strip()
-                else:
-                    function_payload = getattr(tc, "function", None)
-                    tool_call_id = str(getattr(tc, "id", "")).strip()
-
-                if function_payload is None or not tool_call_id:
-                    continue
-
-                if isinstance(function_payload, dict):
-                    function_name = str(function_payload.get("name", "")).strip()
-                    raw_args = str(function_payload.get("arguments", "{}") or "{}")
-                else:
-                    function_name = str(getattr(function_payload, "name", "")).strip()
-                    raw_args = str(getattr(function_payload, "arguments", "{}") or "{}")
-
-                if not function_name:
-                    continue
-
-                parsed_args = self._safe_parse_tool_args(raw_args)
-                tool_calls.append({"tool_name": function_name, "arguments": parsed_args})
-
-                tool_result = tool_executor(function_name, parsed_args)
-                if hasattr(tool_result, "__dict__"):
-                    result_payload = dict(tool_result.__dict__)
-                elif isinstance(tool_result, dict):
-                    result_payload = tool_result
-                else:
-                    result_payload = {
-                        "tool_name": function_name,
+        try:
+            result = self.admin_agent.run_sync(
+                prompt,
+                deps=deps,
+                instructions=instructions,
+                model_settings={"temperature": 0.1},
+            )
+            assistant_message = str(result.output).strip() or "Nao encontrei dados no grafo para responder com seguranca."
+            return {
+                "assistant_message": assistant_message,
+                "tool_calls": deps.tool_calls,
+                "tool_results": deps.tool_results,
+            }
+        except Exception as exc:
+            logger.exception("admin_assistant_failed")
+            return {
+                "assistant_message": (
+                    "Nao consegui usar as tools de grafo com o provedor atual. "
+                    "Verifique suporte a function-calling/ferramentas no modelo configurado."
+                ),
+                "tool_calls": deps.tool_calls,
+                "tool_results": deps.tool_results
+                + [
+                    {
+                        "tool_name": "tool_runtime",
                         "ok": False,
-                        "result": {"error": "Invalid tool result."},
+                        "result": {"error": str(exc)},
                         "duration_ms": 0,
                     }
-                tool_results.append(result_payload)
-                tool_results_payload.append((tool_call_id, result_payload))
-
-            # Preserve provider-specific fields from the original assistant message
-            # (e.g. Gemini thought signatures required for subsequent tool turns).
-            response_message_dump = self._message_dump(response_message)
-            messages.append(response_message_dump)
-            for tool_call_id, result_payload in tool_results_payload:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": json.dumps(result_payload, ensure_ascii=False),
-                    }
-                )
-
-        # If tool rounds are exhausted, force a final natural-language answer without additional tools.
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Tool budget exhausted. You must now answer the user using only tool results already present "
-                    "in the conversation. Do not call tools. Be concise and data-grounded."
-                ),
+                ],
             }
-        )
+
+    def _register_admin_tools(self) -> None:
+        @self.admin_agent.tool
+        def describe_graph_schema(ctx: RunContext[AdminAgentDeps]) -> dict[str, Any]:
+            """Inspect current graph vocabulary to ground follow-up queries."""
+            args: dict[str, Any] = {}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "describe_graph_schema",
+                args,
+                lambda: ctx.deps.graph_tools.describe_graph_schema(),
+            )
+
+        @self.admin_agent.tool
+        def find_entity(ctx: RunContext[AdminAgentDeps], name: str, entity_type: str | None = None) -> dict[str, Any]:
+            """Find entities by partial name and optional entity type."""
+            args = {"name": name, "entity_type": entity_type}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "find_entity",
+                args,
+                lambda: ctx.deps.graph_tools.find_entity(name=name, entity_type=entity_type),
+            )
+
+        @self.admin_agent.tool
+        def neighbors(
+            ctx: RunContext[AdminAgentDeps], entity_name: str, depth: int = 1, limit: int = 50
+        ) -> dict[str, Any]:
+            """Get one-hop or two-hop neighbors for an entity name."""
+            args = {"entity_name": entity_name, "depth": depth, "limit": limit}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "neighbors",
+                args,
+                lambda: ctx.deps.graph_tools.neighbors(entity_name=entity_name, depth=depth, limit=limit),
+            )
+
+        @self.admin_agent.tool
+        def recent_relations(ctx: RunContext[AdminAgentDeps], limit: int = 50) -> dict[str, Any]:
+            """Return most recent relations added or updated in graph."""
+            args = {"limit": limit}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "recent_relations",
+                args,
+                lambda: ctx.deps.graph_tools.recent_relations(limit=limit),
+            )
+
+        @self.admin_agent.tool
+        def run_graph_query(
+            ctx: RunContext[AdminAgentDeps],
+            cypher: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            """Run a read-only Cypher query with validation and row limits."""
+            args = {"cypher": cypher, "params": params or {}}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "run_graph_query",
+                args,
+                lambda: ctx.deps.graph_tools.run_graph_query(cypher=cypher, params=params or {}),
+            )
+
+    def _execute_admin_tool_safely(
+        self,
+        ctx: RunContext[AdminAgentDeps],
+        tool_name: str,
+        arguments: dict[str, Any],
+        operation: Callable[[], ToolExecution],
+    ) -> dict[str, Any]:
+        if len(ctx.deps.tool_calls) >= ctx.deps.max_tool_rounds:
+            exhausted = ToolExecution(
+                tool_name=tool_name,
+                ok=False,
+                result={
+                    "error": (
+                        "Tool budget exhausted. Use previously returned tool results to finish the answer "
+                        "without calling more tools."
+                    )
+                },
+                duration_ms=0,
+            )
+            return self._record_admin_tool_call(ctx, tool_name, arguments, exhausted)
+
         try:
-            final_completion = self.client.create(
-                temperature=0.1,
-                messages=messages,  # type: ignore[arg-type]
-            )
-            final_response_message = self._get_choice_message(final_completion)
-            final_message = self._message_content(final_response_message).strip()
-        except Exception:
-            final_message = ""
-
-        if not final_message:
-            final_message = (
-                "Nao consegui consolidar uma resposta final apos o limite de iteracoes de ferramenta. "
-                "Tente refinar a pergunta."
+            execution = operation()
+        except Exception as exc:
+            logger.exception("admin_tool_execution_failed tool=%s", tool_name)
+            execution = ToolExecution(
+                tool_name=tool_name,
+                ok=False,
+                result={"error": str(exc)},
+                duration_ms=0,
             )
 
-        return {
-            "assistant_message": final_message,
-            "tool_calls": tool_calls,
-            "tool_results": tool_results,
+        return self._record_admin_tool_call(ctx, tool_name, arguments, execution)
+
+    def _record_admin_tool_call(
+        self,
+        ctx: RunContext[AdminAgentDeps],
+        tool_name: str,
+        arguments: dict[str, Any],
+        execution: ToolExecution,
+    ) -> dict[str, Any]:
+        ctx.deps.tool_calls.append({"tool_name": tool_name, "arguments": arguments})
+
+        payload = {
+            "tool_name": execution.tool_name,
+            "ok": execution.ok,
+            "result": execution.result,
+            "duration_ms": execution.duration_ms,
         }
+        ctx.deps.tool_results.append(payload)
+        return payload
 
     def _from_entity_graph(self, payload: dict[str, Any]) -> list[Triplet]:
         entities_raw = payload.get("entities", [])
@@ -523,6 +458,7 @@ class LLMExtractor:
 
         entities: dict[str, dict[str, str]] = {}
         entities_by_name: dict[str, dict[str, str]] = {}
+
         for item in entities_raw:
             if not isinstance(item, dict):
                 continue
@@ -542,7 +478,8 @@ class LLMExtractor:
         for item in triplets_raw:
             if not isinstance(item, dict):
                 continue
-            relation = str(item.get("relation", item.get("predicate", ""))).strip()
+
+            relation = str(item.get("relation", "")).strip()
             confidence = item.get("confidence", self.default_confidence)
             if not relation:
                 continue
@@ -581,6 +518,7 @@ class LLMExtractor:
 
             if not subject_entity or not object_entity:
                 continue
+
             normalized = self._normalize_item(
                 {
                     "subject": subject_entity["name"],
@@ -593,23 +531,13 @@ class LLMExtractor:
             )
             if normalized is None:
                 continue
+
             try:
                 result.append(Triplet(**normalized))
             except Exception:
                 continue
-        return result
 
-    def _from_legacy_triplets(self, items: list[Any]) -> list[Triplet]:
-        triplets: list[Triplet] = []
-        for item in items:
-            normalized = self._normalize_item(item)
-            if normalized is None:
-                continue
-            try:
-                triplets.append(Triplet(**normalized))
-            except Exception:
-                continue
-        return triplets
+        return result
 
     def _normalize_item(self, item: Any) -> dict[str, Any] | None:
         if not isinstance(item, dict):
@@ -718,117 +646,56 @@ class LLMExtractor:
             )
         return self._reconcile_entity_types(resolved)
 
-    @staticmethod
-    def _safe_parse_json(raw: str) -> dict[str, Any] | list[Any]:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
+    def _conversation_prompt(self, message: str, history: list[dict] | None = None) -> str:
+        history_lines = [f"{h['role'].upper()}: {h['content']}" for h in (history or [])[-20:]]
+        history_lines.append(f"USER: {message}")
+        return "Conversation:\n" + "\n".join(history_lines)
 
-        fenced_match = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", raw, flags=re.DOTALL)
-        if fenced_match:
-            candidate = fenced_match.group(1)
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+    def _build_model(self, api_key: str, base_url: str, model: str, provider: str | None) -> Any:
+        model_name, provider_name = self._normalize_model_and_provider(model=model, provider=provider)
+        provider_base_url = (base_url or "").strip() or None
 
-        object_match = re.search(r"(\{.*\})", raw, flags=re.DOTALL)
-        if object_match:
-            candidate = object_match.group(1)
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+        if provider_name in {"google-gla", "google-vertex"}:
+            google_provider = GoogleProvider(
+                api_key=api_key or None,
+                vertexai=(provider_name == "google-vertex"),
+                base_url=provider_base_url,
+            )
+            return GoogleModel(model_name=model_name, provider=google_provider)
 
-        array_match = re.search(r"(\[.*\])", raw, flags=re.DOTALL)
-        if array_match:
-            candidate = array_match.group(1)
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+        openai_provider = OpenAIProvider(api_key=api_key or None, base_url=provider_base_url)
+        return OpenAIModel(model_name=model_name, provider=openai_provider)
 
-        return {"triplets": []}
+    def _normalize_model_and_provider(self, model: str, provider: str | None) -> tuple[str, str]:
+        raw_model = (model or "").strip()
+        raw_provider = (provider or "").strip().lower()
 
-    @staticmethod
-    def _safe_parse_tool_args(raw: str) -> dict[str, Any]:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            return {}
-        return {}
+        if ":" in raw_model:
+            inferred_provider, parsed_model = raw_model.split(":", 1)
+            return parsed_model.strip(), self._normalize_provider_name(inferred_provider.strip())
 
-    @staticmethod
-    def _get_choice_message(completion: Any) -> Any:
-        choices = getattr(completion, "choices", None)
-        if choices and isinstance(choices, list):
-            message = getattr(choices[0], "message", None)
-            if message is not None:
-                return message
-            if isinstance(choices[0], dict):
-                return choices[0].get("message") or {}
+        if "/" in raw_model:
+            inferred_provider, parsed_model = raw_model.split("/", 1)
+            return parsed_model.strip(), self._normalize_provider_name(inferred_provider.strip())
 
-        if isinstance(completion, dict):
-            dict_choices = completion.get("choices")
-            if isinstance(dict_choices, list) and dict_choices:
-                choice0 = dict_choices[0]
-                if isinstance(choice0, dict):
-                    return choice0.get("message") or {}
-        return {}
+        if not raw_model:
+            return "gpt-4o-mini", "openai"
+
+        if raw_provider:
+            return raw_model, self._normalize_provider_name(raw_provider)
+
+        if raw_model.startswith("gemini"):
+            return raw_model, "google-gla"
+
+        return raw_model, "openai"
 
     @staticmethod
-    def _message_content(message: Any) -> str:
-        if isinstance(message, dict):
-            content = message.get("content", "")
-            return str(content or "")
-        return str(getattr(message, "content", "") or "")
-
-    @staticmethod
-    def _message_tool_calls(message: Any) -> list[Any]:
-        if isinstance(message, dict):
-            tool_calls = message.get("tool_calls", [])
-            return tool_calls if isinstance(tool_calls, list) else []
-
-        tool_calls = getattr(message, "tool_calls", [])
-        return tool_calls if isinstance(tool_calls, list) else []
-
-    @staticmethod
-    def _message_dump(message: Any) -> dict[str, Any]:
-        if hasattr(message, "model_dump"):
-            dumped = message.model_dump(exclude_none=True)
-            if isinstance(dumped, dict):
-                return dumped
-        if isinstance(message, dict):
-            return message
-        return {"role": "assistant", "content": str(getattr(message, "content", "") or "")}
-
-    @staticmethod
-    def _chunk_content(chunk: Any) -> str | None:
-        choices = getattr(chunk, "choices", None)
-        if choices and isinstance(choices, list):
-            delta = getattr(choices[0], "delta", None)
-            if delta is not None:
-                content = getattr(delta, "content", None)
-                if content:
-                    return str(content)
-            if isinstance(choices[0], dict):
-                dict_delta = choices[0].get("delta", {})
-                if isinstance(dict_delta, dict):
-                    content = dict_delta.get("content")
-                    if content:
-                        return str(content)
-
-        if isinstance(chunk, dict):
-            dict_choices = chunk.get("choices")
-            if isinstance(dict_choices, list) and dict_choices:
-                choice0 = dict_choices[0]
-                if isinstance(choice0, dict):
-                    dict_delta = choice0.get("delta", {})
-                    if isinstance(dict_delta, dict):
-                        content = dict_delta.get("content")
-                        if content:
-                            return str(content)
-        return None
+    def _normalize_provider_name(provider: str) -> str:
+        normalized = provider.strip().lower()
+        if normalized in {"gemini", "google", "google-gla"}:
+            return "google-gla"
+        if normalized in {"vertexai", "google-vertex"}:
+            return "google-vertex"
+        if normalized in {"openai", "openai-chat"}:
+            return "openai"
+        return normalized or "openai"

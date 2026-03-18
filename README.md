@@ -5,7 +5,7 @@ Demo local que transforma conversas em linguagem natural em um grafo de conhecim
 ## O que a demo mostra
 
 - Usuario conversa em uma UI de chat (Streamlit).
-- Backend FastAPI envia cada mensagem para um LLM via SDK OpenAI compativel.
+- Backend FastAPI envia cada mensagem para agentes pydantic-ai (agnosticos a provedor).
 - O LLM retorna triplas estruturadas.
 - O backend faz upsert dessas triplas no Neo4j com deduplicacao.
 - Historico do chat fica salvo em SQLite.
@@ -15,12 +15,12 @@ Demo local que transforma conversas em linguagem natural em um grafo de conhecim
 - Neo4j (grafo)
 - FastAPI (backend Python)
 - Streamlit (frontend)
-- OpenAI SDK (endpoint OpenAI ou compativel, como Gemini)
+- pydantic-ai (OpenAI, Gemini e outros provedores)
 - `uv` para gerenciamento Python
 
 ## Subir tudo com um comando
 
-1. Ajuste `.env` a partir de `.env.example` (principalmente `OPENAI_API_KEY`).
+1. Ajuste `.env` a partir de `.env.example` (principalmente `LLM_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`).
 2. Execute:
 
 ```bash
@@ -35,18 +35,25 @@ docker compose up --build
 
 ## Variaveis principais
 
-- `OPENAI_API_KEY`
-- `OPENAI_BASE_URL`
-- `OPENAI_MODEL`
+- `LLM_API_KEY`
+- `LLM_BASE_URL`
+- `LLM_PROVIDER`
+- `LLM_MODEL`
 - `NEO4J_USERNAME`
 - `NEO4J_PASSWORD`
 - `NEO4J_DATABASE`
 
-Para Gemini via endpoint compativel OpenAI, use:
+Para Gemini com provider nativo via pydantic-ai, use:
 
-- `OPENAI_BASE_URL=https://generativelanguage.googleapis.com/openai/`
-- `OPENAI_MODEL=gemini-2.0-flash`
-- `OPENAI_API_KEY=<sua-chave-gemini>`
+- `LLM_PROVIDER=google-gla`
+- `LLM_MODEL=gemini-3-flash-preview`
+- `LLM_API_KEY=<sua-chave-gemini>`
+
+Para demo com OpenAI, use:
+
+- `LLM_PROVIDER=openai`
+- `LLM_MODEL=gpt-4o-mini`
+- `LLM_API_KEY=<sua-chave-openai>`
 
 ## Exemplo de mensagem e tripla
 

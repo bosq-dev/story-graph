@@ -56,7 +56,7 @@ def send_admin_message_stream(
                 message=payload.message,
                 user_name=payload.user_name,
                 history=history,
-                tool_executor=graph_tools.execute_tool,
+                graph_tools=graph_tools,
             )
             tool_calls = outcome.get("tool_calls", [])
             tool_results = outcome.get("tool_results", [])
