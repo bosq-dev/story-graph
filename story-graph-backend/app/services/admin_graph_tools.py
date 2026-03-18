@@ -114,6 +114,62 @@ class AdminGraphTools:
             duration_ms=self._duration_ms(started),
         )
 
+    def describe_graph_schema(self) -> ToolExecution:
+        started = time.perf_counter()
+        try:
+            labels_rows = self.graph_repo.run_readonly_query(
+                cypher="MATCH (n) WITH labels(n) AS ls UNWIND ls AS label RETURN DISTINCT label ORDER BY label LIMIT 50",
+                params={},
+                row_limit=50,
+            )
+            rel_type_rows = self.graph_repo.run_readonly_query(
+                cypher="MATCH ()-[r]->() RETURN DISTINCT type(r) AS relationship_type ORDER BY relationship_type LIMIT 50",
+                params={},
+                row_limit=50,
+            )
+            entity_type_rows = self.graph_repo.run_readonly_query(
+                cypher="MATCH (e:Entity) WHERE e.entity_type IS NOT NULL RETURN DISTINCT e.entity_type AS entity_type ORDER BY entity_type LIMIT 100",
+                params={},
+                row_limit=100,
+            )
+            relation_type_rows = self.graph_repo.run_readonly_query(
+                cypher="MATCH (:Entity)-[r:RELATED]->(:Entity) WHERE r.relation_type IS NOT NULL RETURN DISTINCT r.relation_type AS relation_type ORDER BY relation_type LIMIT 200",
+                params={},
+                row_limit=200,
+            )
+            sample_entities = self.graph_repo.run_readonly_query(
+                cypher="MATCH (e:Entity) RETURN e.name AS name, e.entity_type AS entity_type LIMIT 20",
+                params={},
+                row_limit=20,
+            )
+
+            return ToolExecution(
+                tool_name="describe_graph_schema",
+                ok=True,
+                result={
+                    "labels": [row.get("label") for row in labels_rows if row.get("label")],
+                    "relationship_types": [
+                        row.get("relationship_type") for row in rel_type_rows if row.get("relationship_type")
+                    ],
+                    "entity_types": [
+                        row.get("entity_type") for row in entity_type_rows if row.get("entity_type")
+                    ],
+                    "relation_types": [
+                        row.get("relation_type") for row in relation_type_rows if row.get("relation_type")
+                    ],
+                    "sample_entities": sample_entities,
+                },
+                duration_ms=self._duration_ms(started),
+            )
+        except Exception as exc:
+            logger.warning("admin_tool_describe_graph_schema_failed error=%s", exc)
+            return ToolExecution(
+                tool_name="describe_graph_schema",
+                ok=False,
+                result={"error": str(exc)},
+                duration_ms=self._duration_ms(started),
+            )
+
     def execute_tool(self, name: str, arguments: dict[str, Any]) -> ToolExecution:
         started = time.perf_counter()
         if name == "run_graph_query":
@@ -140,6 +196,10 @@ class AdminGraphTools:
             return result
         if name == "recent_relations":
             result = self.recent_relations(limit=int(arguments.get("limit", 50)))
+            logger.info("admin_tool_call tool=%s ok=%s duration_ms=%s", name, result.ok, result.duration_ms)
+            return result
+        if name == "describe_graph_schema":
+            result = self.describe_graph_schema()
             logger.info("admin_tool_call tool=%s ok=%s duration_ms=%s", name, result.ok, result.duration_ms)
             return result
         logger.warning("admin_tool_unknown tool=%s", name)

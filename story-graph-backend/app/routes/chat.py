@@ -1,4 +1,7 @@
 import json
+import logging
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -13,6 +16,7 @@ from app.schemas import (
 from app.state import AppServices
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
 
 
 def get_services(request: Request) -> AppServices:
@@ -25,7 +29,17 @@ def format_sse(event: str, payload: dict) -> str:
 
 @router.post("/message", response_model=ChatMessageResponse)
 def send_message(payload: ChatMessageRequest, services: AppServices = Depends(get_services)) -> ChatMessageResponse:
+    request_id = uuid4().hex[:8]
     session_id = services.chat_repo.ensure_session(payload.session_id, payload.user_id, payload.user_name)
+
+    logger.info(
+        "chat_message_start request_id=%s session_id=%s user_name=%s message_len=%s profile=%s",
+        request_id,
+        session_id,
+        payload.user_name,
+        len(payload.message),
+        payload.prompt_profile,
+    )
 
     history = services.chat_repo.get_history(session_id, limit=30)
     user_message_id = services.chat_repo.add_message(session_id, "user", payload.message)
@@ -45,6 +59,12 @@ def send_message(payload: ChatMessageRequest, services: AppServices = Depends(ge
             history,
         )
     except Exception as exc:
+        logger.exception(
+            "chat_message_error request_id=%s session_id=%s exception_type=%s",
+            request_id,
+            session_id,
+            type(exc).__name__,
+        )
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
     services.chat_repo.add_message(session_id, "assistant", assistant_message)
@@ -61,7 +81,17 @@ def send_message(payload: ChatMessageRequest, services: AppServices = Depends(ge
 
 @router.post("/message/stream")
 def send_message_stream(payload: ChatMessageRequest, services: AppServices = Depends(get_services)) -> StreamingResponse:
+    request_id = uuid4().hex[:8]
     session_id = services.chat_repo.ensure_session(payload.session_id, payload.user_id, payload.user_name)
+
+    logger.info(
+        "chat_stream_start request_id=%s session_id=%s user_name=%s message_len=%s profile=%s",
+        request_id,
+        session_id,
+        payload.user_name,
+        len(payload.message),
+        payload.prompt_profile,
+    )
 
     history = services.chat_repo.get_history(session_id, limit=30)
     user_message_id = services.chat_repo.add_message(session_id, "user", payload.message)
@@ -75,6 +105,12 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
             source_message=payload.message,
         )
     except Exception as exc:
+        logger.exception(
+            "chat_stream_extraction_error request_id=%s session_id=%s exception_type=%s",
+            request_id,
+            session_id,
+            type(exc).__name__,
+        )
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
 
     def event_stream():
@@ -100,9 +136,27 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
                 extracted_triplets=triplets,
                 stored_triplets_count=stored_triplets,
             ).model_dump()
-            yield format_sse("done", response_payload)
+            logger.info(
+                "chat_stream_done request_id=%s session_id=%s triplets=%s tokens=%s",
+                request_id,
+                session_id,
+                len(triplets),
+                len(collected_tokens),
+            )
+            yield format_sse("done", {**response_payload, "request_id": request_id})
         except Exception as exc:
-            yield format_sse("error", {"detail": f"LLM stream failed: {exc}"})
+            logger.exception(
+                "chat_stream_runtime_error request_id=%s session_id=%s exception_type=%s tokens_collected=%s",
+                request_id,
+                session_id,
+                type(exc).__name__,
+                len(collected_tokens),
+            )
+            yield format_sse("error", {
+                "detail": f"LLM stream failed: {exc}",
+                "request_id": request_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
 
     return StreamingResponse(
         event_stream(),

@@ -141,6 +141,17 @@ ADMIN_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "describe_graph_schema",
+            "description": "Inspect current graph vocabulary: labels, relationship types, entity_types, relation_types and sample entities.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_entity",
             "description": "Find entities by partial name and optional type.",
             "parameters": {
@@ -350,7 +361,7 @@ class LLMExtractor:
         user_name: str,
         history: list[dict] | None,
         tool_executor: Callable[[str, dict[str, Any]], Any],
-        max_tool_rounds: int = 4,
+        max_tool_rounds: int = 6,
     ) -> dict[str, Any]:
         messages: list[dict[str, Any]] = [
             {
@@ -364,7 +375,12 @@ class LLMExtractor:
                 "role": "system",
                 "content": (
                     "Use tools to answer graph questions. "
-                    "If the user asks about relationships, call tools before answering."
+                    "Playbook: call describe_graph_schema before free-form Cypher; "
+                    "prefer canonical graph model discovered from schema; "
+                    "use find_entity/neighbors for targeted exploration; "
+                    "use run_graph_query only after aligning labels/properties with discovered schema; "
+                    "if query fails with unknown label/property/relationship, refresh schema and retry with corrected Cypher; "
+                    "never invent labels like Quarto/Problema/TEM_PROBLEMA unless schema confirms them."
                 ),
             },
         ]
@@ -460,12 +476,38 @@ class LLMExtractor:
                     {
                         "role": "tool",
                         "tool_call_id": tool_call_id,
-                        "content": json.dumps(result_payload.get("result", {}), ensure_ascii=False),
+                        "content": json.dumps(result_payload, ensure_ascii=False),
                     }
                 )
 
+        # If tool rounds are exhausted, force a final natural-language answer without additional tools.
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Tool budget exhausted. You must now answer the user using only tool results already present "
+                    "in the conversation. Do not call tools. Be concise and data-grounded."
+                ),
+            }
+        )
+        try:
+            final_completion = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0.1,
+                messages=messages,  # type: ignore[arg-type]
+            )
+            final_message = (final_completion.choices[0].message.content or "").strip()
+        except Exception:
+            final_message = ""
+
+        if not final_message:
+            final_message = (
+                "Nao consegui consolidar uma resposta final apos o limite de iteracoes de ferramenta. "
+                "Tente refinar a pergunta."
+            )
+
         return {
-            "assistant_message": "A consulta exigiu muitas iteracoes de ferramenta. Tente refinar a pergunta.",
+            "assistant_message": final_message,
             "tool_calls": tool_calls,
             "tool_results": tool_results,
         }
