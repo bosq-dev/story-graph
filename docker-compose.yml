@@ -41,6 +41,7 @@ services:
       NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
       SQLITE_PATH: /data/chat_history.db
       EXTRACTION_CONFIDENCE_DEFAULT: ${EXTRACTION_CONFIDENCE_DEFAULT:-0.75}
+      PYTHONUNBUFFERED: 1
     ports:
       - "8000:8000"
     volumes:

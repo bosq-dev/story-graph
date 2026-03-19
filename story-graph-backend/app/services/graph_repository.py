@@ -1,9 +1,20 @@
 from datetime import datetime, timezone
 
 from neo4j import GraphDatabase
+from loguru import logger
 
 from app.config import ALLOWED_ENTITY_TYPES
 from app.schemas import Triplet
+
+
+RELATION_ALIASES: dict[str, str] = {
+    "is_in": "is_at",
+    "located_in": "is_at",
+    "located_at": "is_at",
+    "is_inside": "is_at",
+    "inside": "is_at",
+    "in": "is_at",
+}
 
 
 class GraphRepository:
@@ -19,14 +30,77 @@ class GraphRepository:
         )
         with self._driver.session(database=self.database) as session:
             session.run(constraint_query)
+            self._run_normalization_maintenance(session)
+
+    def _run_normalization_maintenance(self, session) -> None:
+        renamed_count = int(
+            (
+                session.run(
+                    """
+                    MATCH (e:Entity)
+                    WHERE e.normalized_name CONTAINS '_'
+                    WITH e, trim(replace(toLower(e.normalized_name), '_', ' ')) AS target_normalized
+                    WHERE target_normalized <> e.normalized_name
+                      AND NOT EXISTS {
+                        MATCH (:Entity {entity_type: e.entity_type, normalized_name: target_normalized})
+                      }
+                    SET e.normalized_name = target_normalized
+                    RETURN count(e) AS renamed_count
+                    """
+                ).single()
+                or {"renamed_count": 0}
+            )["renamed_count"]
+        )
+
+        migrated_relation_count = int(
+            (
+                session.run(
+                    """
+                    MATCH (s:Entity)-[r:RELATED]->(o:Entity)
+                    WHERE r.relation_type IN $legacy_relation_types
+                    MERGE (s)-[m:RELATED {relation_type: $canonical_relation_type}]->(o)
+                      ON CREATE SET
+                        m.created_at = coalesce(r.created_at, $timestamp),
+                        m.updated_at = coalesce(r.updated_at, $timestamp),
+                        m.first_source_message_id = r.first_source_message_id,
+                        m.first_source_message = r.first_source_message,
+                        m.last_source_message_id = r.last_source_message_id,
+                        m.last_source_message = r.last_source_message,
+                        m.first_confidence = r.first_confidence,
+                        m.last_confidence = r.last_confidence,
+                        m.mentions_count = coalesce(r.mentions_count, 1)
+                      ON MATCH SET
+                        m.updated_at = coalesce(r.updated_at, m.updated_at),
+                        m.last_source_message_id = coalesce(r.last_source_message_id, m.last_source_message_id),
+                        m.last_source_message = coalesce(r.last_source_message, m.last_source_message),
+                        m.last_confidence = coalesce(r.last_confidence, m.last_confidence),
+                        m.mentions_count = coalesce(m.mentions_count, 1) + coalesce(r.mentions_count, 1)
+                    DELETE r
+                    RETURN count(*) AS migrated_relation_count
+                    """,
+                    legacy_relation_types=list(RELATION_ALIASES.keys()),
+                    canonical_relation_type="is_at",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                ).single()
+                or {"migrated_relation_count": 0}
+            )["migrated_relation_count"]
+        )
+
+        if renamed_count or migrated_relation_count:
+            logger.info(
+                "graph_normalization_maintenance renamed_entities={} migrated_relations={}",
+                renamed_count,
+                migrated_relation_count,
+            )
 
     @staticmethod
     def _normalize_entity(value: str) -> str:
-        return " ".join(value.strip().lower().split())
+        return " ".join(value.strip().lower().replace("_", " ").split())
 
     @staticmethod
     def _normalize_relation(value: str) -> str:
-        return "_".join(value.strip().lower().split())
+        normalized = "_".join(value.strip().lower().replace("-", " ").split())
+        return RELATION_ALIASES.get(normalized, normalized)
 
     @staticmethod
     def _resolve_entity_type(
@@ -46,6 +120,29 @@ class GraphRepository:
             normalized_name=normalized_name,
         ).single()
         existing_types = result["existing_types"] if result and result["existing_types"] else []
+
+        # Promote prior generic Concept entities when a stronger resolved type arrives,
+        # as long as target (normalized_name, requested_type) does not already exist.
+        if (
+            requested_type != "Concept"
+            and "Concept" in existing_types
+            and requested_type not in existing_types
+        ):
+            promotion_result = session.run(
+                """
+                MATCH (e:Entity {normalized_name: $normalized_name, entity_type: 'Concept'})
+                OPTIONAL MATCH (target:Entity {normalized_name: $normalized_name, entity_type: $requested_type})
+                WITH e, target
+                WHERE target IS NULL
+                SET e.entity_type = $requested_type
+                RETURN count(e) AS promoted_count
+                """,
+                normalized_name=normalized_name,
+                requested_type=requested_type,
+            ).single()
+            promoted_count = int(promotion_result["promoted_count"]) if promotion_result else 0
+            if promoted_count > 0:
+                existing_types = [requested_type if value == "Concept" else value for value in existing_types]
 
         if requested_type in existing_types:
             resolved = requested_type

@@ -1,16 +1,15 @@
 import re
 import time
-import logging
 from dataclasses import dataclass
 from typing import Any
 
 from app.services.graph_repository import GraphRepository
+from loguru import logger
 
 _FORBIDDEN_PATTERN = re.compile(
     r"\b(create|merge|delete|detach|set|remove|drop|call\s+dbms|apoc|load\s+csv|foreach|grant|deny|revoke)\b",
     flags=re.IGNORECASE,
 )
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,7 +42,7 @@ class AdminGraphTools:
                 duration_ms=self._duration_ms(started),
             )
         except Exception as exc:
-            logger.warning("admin_tool_run_graph_query_rejected error=%s", exc)
+            logger.warning("admin_tool_run_graph_query_rejected error={}", exc)
             return ToolExecution(
                 tool_name="run_graph_query",
                 ok=False,
@@ -81,7 +80,11 @@ class AdminGraphTools:
         if safe_depth == 1:
             query = """
             MATCH (e:Entity {normalized_name: $normalized_name})-[r:RELATED]-(n:Entity)
-            RETURN e.name AS center, type(r) AS relation_type, n.name AS neighbor, n.entity_type AS neighbor_type
+                        RETURN
+                            e.name AS center,
+                            coalesce(r.relation_type, type(r)) AS relation_type,
+                            n.name AS neighbor,
+                            n.entity_type AS neighbor_type
             LIMIT $limit
             """
         else:
@@ -162,7 +165,7 @@ class AdminGraphTools:
                 duration_ms=self._duration_ms(started),
             )
         except Exception as exc:
-            logger.warning("admin_tool_describe_graph_schema_failed error=%s", exc)
+            logger.warning("admin_tool_describe_graph_schema_failed error={}", exc)
             return ToolExecution(
                 tool_name="describe_graph_schema",
                 ok=False,
@@ -177,14 +180,14 @@ class AdminGraphTools:
                 cypher=str(arguments.get("cypher", "")),
                 params=arguments.get("params"),
             )
-            logger.info("admin_tool_call tool=%s ok=%s duration_ms=%s", name, result.ok, result.duration_ms)
+            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
             return result
         if name == "find_entity":
             result = self.find_entity(
                 name=str(arguments.get("name", "")),
                 entity_type=arguments.get("entity_type"),
             )
-            logger.info("admin_tool_call tool=%s ok=%s duration_ms=%s", name, result.ok, result.duration_ms)
+            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
             return result
         if name == "neighbors":
             result = self.neighbors(
@@ -192,17 +195,17 @@ class AdminGraphTools:
                 depth=int(arguments.get("depth", 1)),
                 limit=int(arguments.get("limit", 50)),
             )
-            logger.info("admin_tool_call tool=%s ok=%s duration_ms=%s", name, result.ok, result.duration_ms)
+            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
             return result
         if name == "recent_relations":
             result = self.recent_relations(limit=int(arguments.get("limit", 50)))
-            logger.info("admin_tool_call tool=%s ok=%s duration_ms=%s", name, result.ok, result.duration_ms)
+            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
             return result
         if name == "describe_graph_schema":
             result = self.describe_graph_schema()
-            logger.info("admin_tool_call tool=%s ok=%s duration_ms=%s", name, result.ok, result.duration_ms)
+            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
             return result
-        logger.warning("admin_tool_unknown tool=%s", name)
+        logger.warning("admin_tool_unknown tool={}", name)
         return ToolExecution(
             tool_name=name,
             ok=False,
@@ -257,7 +260,7 @@ class AdminGraphTools:
 
     @staticmethod
     def _normalize_name(value: str) -> str:
-        return " ".join(value.strip().lower().split())
+        return " ".join(value.strip().lower().replace("_", " ").split())
 
     @staticmethod
     def _duration_ms(started: float) -> int:

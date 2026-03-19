@@ -1,5 +1,4 @@
 import json
-import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -14,9 +13,9 @@ from app.schemas import (
     ChatSessionSummary,
 )
 from app.state import AppServices
+from loguru import logger
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-logger = logging.getLogger(__name__)
 
 
 def get_services(request: Request) -> AppServices:
@@ -33,7 +32,7 @@ def send_message(payload: ChatMessageRequest, services: AppServices = Depends(ge
     session_id = services.chat_repo.ensure_session(payload.session_id, payload.user_id, payload.user_name)
 
     logger.info(
-        "chat_message_start request_id=%s session_id=%s user_name=%s message_len=%s profile=%s",
+        "chat_message_start request_id={} session_id={} user_name={} message_len={} profile={}",
         request_id,
         session_id,
         payload.user_name,
@@ -44,8 +43,12 @@ def send_message(payload: ChatMessageRequest, services: AppServices = Depends(ge
     history = services.chat_repo.get_history(session_id, limit=30)
     user_message_id = services.chat_repo.add_message(session_id, "user", payload.message)
     try:
-        triplets = services.llm_extractor.extract_triplets(
-            payload.message, payload.user_name, payload.prompt_profile, history
+        triplets = services.llm_extractor.extract_and_stage(
+            message=payload.message,
+            user_name=payload.user_name,
+            prompt_profile=payload.prompt_profile,
+            graph_repo=services.graph_repo,
+            history=history,
         )
         stored_triplets = services.graph_repo.upsert_triplets(
             triplets=triplets,
@@ -60,7 +63,7 @@ def send_message(payload: ChatMessageRequest, services: AppServices = Depends(ge
         )
     except Exception as exc:
         logger.exception(
-            "chat_message_error request_id=%s session_id=%s exception_type=%s",
+            "chat_message_error request_id={} session_id={} exception_type={}",
             request_id,
             session_id,
             type(exc).__name__,
@@ -85,7 +88,7 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
     session_id = services.chat_repo.ensure_session(payload.session_id, payload.user_id, payload.user_name)
 
     logger.info(
-        "chat_stream_start request_id=%s session_id=%s user_name=%s message_len=%s profile=%s",
+        "chat_stream_start request_id={} session_id={} user_name={} message_len={} profile={}",
         request_id,
         session_id,
         payload.user_name,
@@ -96,8 +99,12 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
     history = services.chat_repo.get_history(session_id, limit=30)
     user_message_id = services.chat_repo.add_message(session_id, "user", payload.message)
     try:
-        triplets = services.llm_extractor.extract_triplets(
-            payload.message, payload.user_name, payload.prompt_profile, history
+        triplets = services.llm_extractor.extract_and_stage(
+            message=payload.message,
+            user_name=payload.user_name,
+            prompt_profile=payload.prompt_profile,
+            graph_repo=services.graph_repo,
+            history=history,
         )
         stored_triplets = services.graph_repo.upsert_triplets(
             triplets=triplets,
@@ -106,7 +113,7 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
         )
     except Exception as exc:
         logger.exception(
-            "chat_stream_extraction_error request_id=%s session_id=%s exception_type=%s",
+            "chat_stream_extraction_error request_id={} session_id={} exception_type={}",
             request_id,
             session_id,
             type(exc).__name__,
@@ -137,7 +144,7 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
                 stored_triplets_count=stored_triplets,
             ).model_dump()
             logger.info(
-                "chat_stream_done request_id=%s session_id=%s triplets=%s tokens=%s",
+                "chat_stream_done request_id={} session_id={} triplets={} tokens={}",
                 request_id,
                 session_id,
                 len(triplets),
@@ -146,7 +153,7 @@ def send_message_stream(payload: ChatMessageRequest, services: AppServices = Dep
             yield format_sse("done", {**response_payload, "request_id": request_id})
         except Exception as exc:
             logger.exception(
-                "chat_stream_runtime_error request_id=%s session_id=%s exception_type=%s tokens_collected=%s",
+                "chat_stream_runtime_error request_id={} session_id={} exception_type={} tokens_collected={}",
                 request_id,
                 session_id,
                 type(exc).__name__,
