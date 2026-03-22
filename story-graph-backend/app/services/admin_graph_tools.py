@@ -173,46 +173,6 @@ class AdminGraphTools:
                 duration_ms=self._duration_ms(started),
             )
 
-    def execute_tool(self, name: str, arguments: dict[str, Any]) -> ToolExecution:
-        started = time.perf_counter()
-        if name == "run_graph_query":
-            result = self.run_graph_query(
-                cypher=str(arguments.get("cypher", "")),
-                params=arguments.get("params"),
-            )
-            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
-            return result
-        if name == "find_entity":
-            result = self.find_entity(
-                name=str(arguments.get("name", "")),
-                entity_type=arguments.get("entity_type"),
-            )
-            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
-            return result
-        if name == "neighbors":
-            result = self.neighbors(
-                entity_name=str(arguments.get("entity_name", "")),
-                depth=int(arguments.get("depth", 1)),
-                limit=int(arguments.get("limit", 50)),
-            )
-            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
-            return result
-        if name == "recent_relations":
-            result = self.recent_relations(limit=int(arguments.get("limit", 50)))
-            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
-            return result
-        if name == "describe_graph_schema":
-            result = self.describe_graph_schema()
-            logger.info("admin_tool_call tool={} ok={} duration_ms={}", name, result.ok, result.duration_ms)
-            return result
-        logger.warning("admin_tool_unknown tool={}", name)
-        return ToolExecution(
-            tool_name=name,
-            ok=False,
-            result={"error": f"Unknown tool: {name}"},
-            duration_ms=self._duration_ms(started),
-        )
-
     def _sanitize_readonly_cypher(self, cypher: str) -> str:
         normalized = " ".join(cypher.strip().split())
         if not normalized:
