@@ -26,8 +26,8 @@ class Settings(BaseSettings):
 
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_base_url: str = Field(default="https://api.openai.com/v1", alias="LLM_BASE_URL")
-    llm_model: str = Field(default="openai/gpt-4o-mini", alias="LLM_MODEL")
-    llm_provider: str = Field(default="", alias="LLM_PROVIDER")
+    llm_model: str = Field(default="gpt-4o-mini", alias="LLM_MODEL")
+    llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
 
     neo4j_uri: str = Field(default="bolt://neo4j:7687", alias="NEO4J_URI")
     neo4j_username: str = Field(default="neo4j", alias="NEO4J_USERNAME")
