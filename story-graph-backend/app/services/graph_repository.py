@@ -11,6 +11,9 @@ RELATION_ALIASES: dict[str, str] = {
     "is_in": "is_at",
     "located_in": "is_at",
     "located_at": "is_at",
+    "is_at_location": "is_at",
+    "at_location": "is_at",
+    "in_location": "is_at",
     "is_inside": "is_at",
     "inside": "is_at",
     "in": "is_at",
@@ -266,6 +269,30 @@ class GraphRepository:
         """
         with self._driver.session(database=self.database) as session:
             result = session.run(query, limit=limit)
+            return [record.data() for record in result]
+
+    def list_relations_for_message_ids(self, message_ids: list[str], limit: int = 80) -> list[dict]:
+        if not message_ids:
+            return []
+
+        safe_limit = max(1, min(int(limit), 500))
+        query = """
+        MATCH (s:Entity)-[r:RELATED]->(o:Entity)
+        WHERE r.last_source_message_id IN $message_ids
+           OR r.first_source_message_id IN $message_ids
+        RETURN
+          s.name AS subject,
+          s.entity_type AS subject_type,
+          r.relation_type AS relation,
+          o.name AS object,
+          o.entity_type AS object_type,
+          r.last_confidence AS confidence,
+          r.updated_at AS updated_at
+        ORDER BY r.updated_at DESC
+        LIMIT $limit
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(query, message_ids=message_ids, limit=safe_limit)
             return [record.data() for record in result]
 
     def close(self) -> None:

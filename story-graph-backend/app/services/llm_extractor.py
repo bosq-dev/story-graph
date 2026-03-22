@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import json
 from difflib import SequenceMatcher
 from collections.abc import Callable, Mapping
-from typing import TypeAlias, TypedDict, Iterator
+from typing import NotRequired, TypeAlias, TypedDict, Iterator
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
@@ -26,6 +26,7 @@ ToolResultData: TypeAlias = dict[str, object] | list[dict[str, object]]
 class ConversationTurn(TypedDict):
     role: str
     content: str
+    id: NotRequired[int]
 
 
 class ToolCallRecord(TypedDict):
@@ -244,6 +245,9 @@ RELATION_ALIASES: dict[str, str] = {
     "is_in": "is_at",
     "located_in": "is_at",
     "located_at": "is_at",
+    "is_at_location": "is_at",
+    "at_location": "is_at",
+    "in_location": "is_at",
     "is_inside": "is_at",
     "inside": "is_at",
     "in": "is_at",
@@ -387,13 +391,27 @@ class LLMExtractor:
         user_name: str,
         prompt_profile: str,
         history: list[ConversationTurn] | None = None,
+        prior_session_triplets: list[Triplet] | None = None,
     ) -> list[Triplet]:
+        prior_triplets_block = ""
+        if prior_session_triplets:
+            prior_payload = {
+                "session_known_triplets": [
+                    triplet.model_dump(mode="python") for triplet in prior_session_triplets[:20]
+                ]
+            }
+            prior_triplets_block = (
+                "\n\nKnown facts already in this same session graph (avoid semantic duplicates):\n"
+                + json.dumps(prior_payload, ensure_ascii=False)
+            )
+
         extraction_request = (
             f"The customer's real name is {user_name}. When the speaker refers to themselves, use the same "
             f"single entity named {user_name} with entity_type User. "
             "Extract ALL triplets visible in the full conversation below. "
             "Return a JSON object with key 'triplets' only.\n\n"
             f"{self._conversation_prompt(message=message, history=history)}"
+            f"{prior_triplets_block}"
         )
 
         try:
@@ -420,11 +438,17 @@ class LLMExtractor:
         graph_repo: GraphRepository,
         history: list[ConversationTurn] | None = None,
     ) -> list[Triplet]:
+        history_ids = [str(item["id"]) for item in (history or []) if "id" in item and isinstance(item["id"], int)]
+        prior_rows = graph_repo.list_relations_for_message_ids(message_ids=history_ids, limit=80)
+        prior_session_triplets = [self._to_triplet(row) for row in prior_rows]
+        prior_session_triplets = [triplet for triplet in prior_session_triplets if triplet is not None]
+
         raw_triplets = self.extract_triplets(
             message=message,
             user_name=user_name,
             prompt_profile=prompt_profile,
             history=history,
+            prior_session_triplets=prior_session_triplets,
         )
         if not raw_triplets:
             return []
@@ -472,9 +496,24 @@ class LLMExtractor:
             tool_results=[],
             max_tool_rounds=self.resolution_tool_max_rounds,
         )
+
+        # Pre-fetch existing entities relevant to the incoming triplets so the agent
+        # can make informed resolution decisions without needing to call tools first.
+        existing_entities = self._fetch_candidate_entities_for_resolution(triplets, graph_tools)
+        existing_entities_block = ""
+        if existing_entities:
+            existing_entities_block = (
+                "\n\nExisting entities in the graph that may be reused (prefer these over creating new paraphrases):\n"
+                + json.dumps(existing_entities, ensure_ascii=False)
+            )
+
         prompt = (
-            "Resolve these canonical triplets against existing entities in graph using tools.\n\n"
+            "Resolve these canonical triplets against existing entities in graph.\n"
+            "IMPORTANT: If an incoming entity is semantically equivalent to an existing entity listed below, "
+            "you MUST rewrite the triplet to use the existing entity name exactly as shown.\n"
+            "For example: 'cheiro ruim' and 'mau cheiro' refer to the same problem - use the existing name.\n\n"
             + json.dumps({"triplets": [triplet.model_dump(mode="python") for triplet in triplets]}, ensure_ascii=False)
+            + existing_entities_block
         )
 
         try:
@@ -485,10 +524,11 @@ class LLMExtractor:
                     RESOLUTION_PROMPT,
                     self._extraction_system_prompt(prompt_profile),
                     (
-                        "Resolution playbook: for Issue entities without exact name match, split phrase into salient tokens "
-                        "and query find_entity per token (for example 'cheiro'). Compare candidate neighbors for shared "
-                        "Location or repeated user reports. If semantic equivalence is high, reuse the existing issue name "
-                        "already in graph instead of creating a new paraphrase node."
+                        "Resolution playbook: Check the 'Existing entities' list provided in the prompt. "
+                        "For Issue entities, identify semantic paraphrases (e.g., 'cheiro ruim' ~ 'mau cheiro', "
+                        "'barulho' ~ 'ruído', 'sujo' ~ 'sujeira') and rewrite to use the EXISTING entity name. "
+                        "If uncertain, you may use tools to explore neighbors and validate context. "
+                        "When rewriting, preserve the exact spelling/casing of the existing entity."
                     ),
                 ],
                 model_settings={"temperature": 0},
@@ -499,8 +539,44 @@ class LLMExtractor:
             logger.exception("resolution_stage_failed")
             resolved = triplets
 
-        # Final deterministic pass to aggressively reuse existing entities by normalized name.
+        # Final deterministic pass to reuse existing entities by normalized name.
+        # This only kicks in for exact/near-exact matches the agent may have missed.
         return self._reuse_existing_entities(resolved, graph_tools)
+
+    def _fetch_candidate_entities_for_resolution(
+        self,
+        triplets: list[Triplet],
+        graph_tools: AdminGraphTools,
+    ) -> list[dict[str, str]]:
+        """Pre-fetch existing entities relevant to incoming triplets for agent context."""
+        candidates: dict[tuple[str, str], dict[str, str]] = {}
+
+        # Collect all entity names and their salient tokens from incoming triplets
+        search_terms: set[str] = set()
+        for triplet in triplets:
+            for name in [triplet.subject, triplet.object]:
+                search_terms.add(name)
+                search_terms.update(self._salient_tokens(name))
+
+        # Query the graph for each search term
+        for term in search_terms:
+            if len(term) < 3:
+                continue
+            execution = graph_tools.find_entity(name=term, entity_type=None)
+            for row in self._tool_rows(execution):
+                row_name = str(row.get("name", "")).strip()
+                row_type = str(row.get("entity_type", "")).strip()
+                row_norm = str(row.get("normalized_name", "")).strip()
+                if row_name and row_type:
+                    key = (row_type, row_norm or self._normalize_entity_name(row_name))
+                    if key not in candidates:
+                        candidates[key] = {
+                            "name": row_name,
+                            "entity_type": row_type,
+                            "normalized_name": row_norm or self._normalize_entity_name(row_name),
+                        }
+
+        return list(candidates.values())
 
     def validate_policy(self, triplets: list[Triplet], prompt_profile: str) -> list[Triplet]:
         if not triplets:
@@ -923,14 +999,14 @@ class LLMExtractor:
         if cache_key in cache:
             return cache[cache_key]
 
-        execution = graph_tools.find_entity(name=name, entity_type=entity_type)
-        if execution.ok:
+        rows = self._entity_candidate_rows(name=name, entity_type=entity_type, graph_tools=graph_tools)
+        if rows:
             best_name, best_type, best_score = self._best_entity_match(
                 entity_name=name,
                 entity_type=entity_type,
-                rows=self._tool_rows(execution),
+                rows=rows,
             )
-            if best_name and best_type and best_score >= self.resolution_match_confidence_threshold:
+            if best_name and best_type and best_score >= self._match_threshold_for_type(entity_type):
                 cache[cache_key] = (best_name, best_type)
                 return cache[cache_key]
 
@@ -951,15 +1027,64 @@ class LLMExtractor:
         entity_type: str,
         graph_tools: AdminGraphTools,
     ) -> bool:
-        execution = graph_tools.find_entity(name=entity_name, entity_type=entity_type)
-        if not execution.ok:
+        rows = self._entity_candidate_rows(name=entity_name, entity_type=entity_type, graph_tools=graph_tools)
+        if not rows:
             return False
         _, _, score = self._best_entity_match(
             entity_name=entity_name,
             entity_type=entity_type,
-            rows=self._tool_rows(execution),
+            rows=rows,
         )
-        return score >= self.resolution_match_confidence_threshold
+        return score >= self._match_threshold_for_type(entity_type)
+
+    def _entity_candidate_rows(
+        self,
+        name: str,
+        entity_type: str,
+        graph_tools: AdminGraphTools,
+    ) -> list[dict[str, object]]:
+        candidates: dict[tuple[str, str], dict[str, object]] = {}
+        queries = [name, *self._salient_tokens(name)]
+        for query in queries:
+            execution = graph_tools.find_entity(name=query, entity_type=entity_type)
+            for row in self._tool_rows(execution):
+                row_name = str(row.get("name", "")).strip()
+                row_type = str(row.get("entity_type", "")).strip()
+                if not row_name or not row_type:
+                    continue
+                row_norm = str(row.get("normalized_name", "")).strip() or self._normalize_entity_name(row_name)
+                candidates[(row_type, row_norm)] = row
+        return list(candidates.values())
+
+    @staticmethod
+    def _salient_tokens(value: str) -> list[str]:
+        stop_tokens = {
+            "de",
+            "da",
+            "do",
+            "das",
+            "dos",
+            "a",
+            "o",
+            "as",
+            "os",
+            "em",
+            "no",
+            "na",
+            "com",
+            "para",
+        }
+        normalized = " ".join(value.strip().lower().replace("_", " ").split())
+        tokens = [token for token in normalized.split() if len(token) >= 4 and token not in stop_tokens]
+        # Preserve order while deduping.
+        return list(dict.fromkeys(tokens))
+
+    def _match_threshold_for_type(self, entity_type: str) -> float:
+        if entity_type == "Activity":
+            return max(0.7, self.resolution_match_confidence_threshold - 0.1)
+        if entity_type == "Issue":
+            return max(0.75, self.resolution_match_confidence_threshold - 0.05)
+        return self.resolution_match_confidence_threshold
 
     def _best_entity_match(
         self,

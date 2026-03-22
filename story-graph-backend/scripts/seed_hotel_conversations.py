@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Seed a fresh Story Graph instance with deterministic hotel conversations.
 
-Creates 3 conversations using profile `hotel_customer_service`:
-- Conversation 1: user reports bad smell in room 2
-- Conversation 2: another user reports the same issue in room 2
-- Conversation 3: third user reports the same issue in a different room
+Creates 4 conversations using profile `hotel_customer_service` with overlap between
+rooms, issues and requested actions so the resulting graph is useful for admin analysis.
 
 This script uses the backend API so all normal extraction/pipeline logic is exercised.
 """
@@ -62,6 +60,12 @@ def run_seed(base_url: str, timeout: int, pause_seconds: float) -> None:
 
     _get_health(health_url, timeout=timeout)
 
+    # Admin question ideas for this dataset:
+    # - Quais problemas mais recorrentes por quarto?
+    # - Quais usuarios pediram troca de quarto ou troca de travesseiro?
+    # - O quarto 2 tem historico de mal cheiro com quantos hospedes diferentes?
+    # - Quais pedidos de reembolso estao associados a problemas de limpeza?
+    # - Quais atividades foram solicitadas para o quarto 7 apos relatos de barulho?
     seeds = [
         ConversationSeed(
             user_id="guest-ana",
@@ -69,6 +73,7 @@ def run_seed(base_url: str, timeout: int, pause_seconds: float) -> None:
             messages=[
                 "Oi, estou no quarto 2 e o quarto esta com cheiro ruim desde cedo.",
                 "Preciso trocar de quarto por causa desse mal cheiro no quarto 2.",
+                "Se nao tiver troca hoje, quero reembolso parcial da diaria.",
             ],
         ),
         ConversationSeed(
@@ -76,14 +81,25 @@ def run_seed(base_url: str, timeout: int, pause_seconds: float) -> None:
             user_name="Bruno",
             messages=[
                 "Boa noite, fiquei no quarto 2 e senti mal cheiro muito forte.",
+                # "Tambem preciso de troca de travesseiros, os que vieram estao umidos.",
             ],
         ),
+        # ConversationSeed(
+        #     user_id="guest-carla",
+        #     user_name="Carla",
+        #     messages=[
+        #         "Estou no quarto 7 e tem barulho no corredor durante a madrugada.",
+        #         "Quero troca de quarto, nao consigo dormir com esse barulho.",
+        #         "Tambem peço checkout tardio sem custo por causa do incidente.",
+        #     ],
+        # ),
         ConversationSeed(
-            user_id="guest-carla",
-            user_name="Carla",
+            user_id="guest-diego",
+            user_name="Diego",
             messages=[
-                "Estou no quarto 7 e aqui esta com mal cheiro.",
-                "Preciso de ajuda, o mal cheiro esta incomodando bastante.",
+                # "No quarto 7 encontrei sujeira no banheiro e toalhas manchadas.",
+                "Solicito limpeza imediata do quarto 7 e troca de enxoval.",
+                # "Se isso nao resolver hoje, vou pedir cancelamento da reserva.",
             ],
         ),
     ]
@@ -151,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=60,
+        default=120,
         help="HTTP timeout in seconds (default: 60)",
     )
     parser.add_argument(
