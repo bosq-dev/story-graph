@@ -1,66 +1,114 @@
+from loguru import logger
+from dataclasses import dataclass
 import json
-import logging
-import re
-from typing import Any, Callable, Iterator
+from difflib import SequenceMatcher
+from collections.abc import Callable, Mapping
+from typing import NotRequired, TypeAlias, TypedDict, Iterator
 
-from openai import OpenAI
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.models import Model
+from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.providers.openai import OpenAIProvider
 
-from app.config import ALLOWED_ENTITY_TYPES
+from app.config import ALLOWED_ENTITY_TYPES, get_settings
 from app.schemas import Triplet
+from app.services.admin_graph_tools import AdminGraphTools, ToolExecution, ToolResultPayload
+from app.services.graph_repository import GraphRepository
 
 
-logger = logging.getLogger(__name__)
+ToolArguments: TypeAlias = dict[str, object]
+ToolResultData: TypeAlias = ToolResultPayload
+
+
+class ConversationTurn(TypedDict):
+    role: str
+    content: str
+    id: NotRequired[int]
+
+
+class ToolCallRecord(TypedDict):
+    tool_name: str
+    arguments: ToolArguments
+
+
+class ToolResultRecord(TypedDict):
+    tool_name: str
+    ok: bool
+    result: ToolResultData
+    duration_ms: int
+
+
+class AdminAssistantRunResult(TypedDict):
+    assistant_message: str
+    tool_calls: list[ToolCallRecord]
+    tool_results: list[ToolResultRecord]
+
+
+class NormalizedTripletPayload(TypedDict):
+    subject: str
+    subject_type: str
+    relation: str
+    object: str
+    object_type: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class DomainPolicy:
+    required_relations: tuple[tuple[str, str, str], ...] = ()
+
+
 
 
 EXTRACTION_PROMPT = """
 You extract knowledge graph triplets from customer service conversations.
-Return JSON only with keys "entities" and "triplets".
-Preferred shape:
+Return JSON only with key "triplets".
+Required shape:
 {
-    "entities": [
-        {
-            "id": "e1",
-            "name": "...",
-            "entity_type": "User|Company|Product|Technology|Feature|Issue|Activity|Location|Concept"
-        }
-    ],
     "triplets": [
         {
-            "subject_id": "e1",
+            "subject": "...",
+            "subject_type": "User|Company|Product|Technology|Feature|Issue|Activity|Location|Concept",
             "relation": "...",
-            "object_id": "e2",
+            "object": "...",
+            "object_type": "User|Company|Product|Technology|Feature|Issue|Activity|Location|Concept",
             "confidence": 0.0_to_1.0
         }
     ]
 }
 
-Also accepted for each triplet item: direct fields
-{"subject":"...", "subject_type":"...", "relation":"...", "object":"...", "object_type":"...", "confidence":0.9}
-
-CRITICAL — graph-first extraction:
+CRITICAL - graph-first extraction:
 - Your primary responsibility in this system is to populate the graph. If there is any complaint, request,
-  or concrete reference (order, room, product, issue), you MUST emit entities and triplets now.
-- Extract entities immediately from PARTIAL information. Do NOT wait for complete data.
-  Example: "Pedido 1234" alone → create entity {"id":"e1","name":"Pedido 1234","entity_type":"Product"}
-  Example: "tamanho errado" alone → create entity {"id":"e2","name":"tamanho errado","entity_type":"Issue"}
+    or concrete reference (order, room, product, issue), you MUST emit triplets now.
+- Extract triplets immediately from PARTIAL information. Do NOT wait for complete data.
+    Example: "Pedido 1234" alone -> {"triplets":[{"subject":"Customer","subject_type":"User","relation":"mentions_product","object":"Pedido 1234","object_type":"Product","confidence":0.9}]}
+    Example: "tamanho errado" alone -> {"triplets":[{"subject":"Customer","subject_type":"User","relation":"reported_issue","object":"tamanho errado","object_type":"Issue","confidence":0.9}]}
 - An order/ticket reference ("pedido 1234", "order #5", "ticket 99") is ALWAYS sufficient to create a Product entity.
 - A complaint or problem is ALWAYS sufficient to create an Issue entity.
-- An action request (troca, devolução, reembolso, cancelamento, limpeza) is ALWAYS an Activity entity.
-- You receive the FULL recent conversation — extract ALL entities and relations visible across all turns,
+- An action request (troca, devolucao, reembolso, cancelamento, limpeza) is ALWAYS an Activity entity.
+- Entity ontology boundary (strict):
+    Entities represent real-world referents or concrete observable states.
+    Do NOT model process artifacts (cases, records, tickets, protocols, internal handling steps) as entities
+    unless the conversation itself is explicitly about that artifact as a business object.
+    For complaints, the Issue must be the concrete symptom/problem (e.g. "mal cheiro", "barulho", "quarto sujo"),
+    while process language should become relation semantics, not entity names.
+- You receive the FULL recent conversation - extract ALL relevant triplets visible across all turns,
   not just the last message. Combine information from different turns into one graph.
-- Reuse the same entity id when the text refers to the same real-world entity.
 - Do not create duplicate entities with different types for the same thing.
 - Keep relations short and normalized in snake_case: reported_issue, requested_action, has_issue,
   affects_order, affects_location, resolved_by, blocked_by, requested_refund, mentions_product.
 - entity_type rules:
-    Order / Pedido / Ticket → Product
-    Concrete complaint / bug / defect → Issue
-    Action request (troca, refund, fix, cancel) → Activity
-    Person / customer → User
-    Brand / store / company → Company
-    Physical space (quarto, andar, loja) → Location
-    Specific item / SKU → Product
-- If truly no extractable information exists, return {"entities": [], "triplets": []}
+    Order / Pedido / Ticket -> Product
+    Concrete complaint / bug / defect -> Issue
+    Action request (troca, refund, fix, cancel) -> Activity
+    Person / customer -> User
+    Brand / store / company -> Company
+    Physical space (quarto, andar, loja) -> Location
+    Specific item / SKU -> Product
+- If truly no extractable information exists, return {"triplets": []}
 - Never add fields outside the schema.
 """.strip()
 
@@ -75,7 +123,7 @@ Goals:
 Critical rules:
 - In this demo, the effective action is to register facts into the knowledge graph.
     So after acknowledging, prioritize concise resolution guidance and avoid long interrogation loops.
-- You receive the FULL recent conversation history. Use it — never ask for information the customer already provided.
+- You receive the FULL recent conversation history. Use it - never ask for information the customer already provided.
 - Ask at most ONE follow-up question per response. If multiple pieces of info are missing, ask only for the most important one.
 - When you already know the order number / issue / request from history, do NOT ask for it again.
 
@@ -85,20 +133,56 @@ Style:
 - Do not invent policies, prices, or guarantees.
 """.strip()
 
+RESOLUTION_PROMPT = """
+You resolve canonical entities against an existing graph.
+
+Rules:
+- Use tools before deciding if entities should be reused.
+- Prefer reusing an existing entity when normalized_name and entity_type match.
+- For Issue entities, also resolve semantic paraphrases (e.g. "cheiro ruim" ~ "mal cheiro")
+    to one canonical existing entity when they represent the same observable problem.
+- To discover paraphrases, search candidates with meaningful keyword tokens (not only full phrase)
+    and validate using local context such as related Location/User neighborhood when available.
+- If multiple candidates exist, pick the most concrete and stable graph name already used.
+- If match is truly weak/ambiguous, keep incoming canonical entity unchanged.
+- Never invent entities that are not present in input or tool results.
+- Preserve ontology quality during reuse: do not reuse process-artifact entities when a concrete domain entity exists.
+- Return JSON with key "triplets" only.
+""".strip()
+
+SEMANTIC_POLICY_GATE_PROMPT = """
+You validate and enforce graph policy and ontology quality on normalized triplets.
+
+Rules:
+- Ensure relation names are snake_case.
+- Enforce types in ALLOWED_ENTITY_TYPES.
+- If an Issue and Location are connected, prefer relation affects_location.
+- Enforce ontology semantics globally:
+    entities must be concrete domain referents; process/administrative artifacts should be normalized away.
+    Convert process language into relations when possible; otherwise drop low-quality triplets.
+- Keep only entities that represent a stable referent in the graph (person/company/location/product/issue/activity/etc.).
+- A valid entity denotes a concrete thing/place/actor/product/technology/feature/activity or an observable issue state.
+- Prefer rewriting invalid entities to the concrete referent already present in context.
+- Keep relation semantics concise and avoid adding new facts.
+- If uncertain, keep high-confidence concrete triplets and drop ambiguous ones.
+
+Return JSON with keys "triplets" and "dropped_reasons".
+""".strip()
+
 PROMPT_PROFILES: dict[str, dict[str, str]] = {
     "hotel_customer_service": {
         "label": "Hotel Customer Service",
         "assistant": (
             "You are assisting hotel guests with reservations, room issues, amenities and incident handling. "
-                "Prioritize empathy, quick triage, and immediate resolution options. "
-                "If the guest reports a room problem (e.g., bad smell, noise, cleanliness), treat it as a concrete issue "
-                "already logged and avoid repeatedly asking for the same details."
+            "Prioritize empathy, quick triage, and immediate resolution options. "
+            "If the guest reports a room problem (e.g., bad smell, noise, cleanliness), treat it as a concrete issue "
+            "already logged and avoid repeatedly asking for the same details."
         ),
         "extraction": (
             "Focus on complaints about room conditions, housekeeping delays, check-in/check-out issues, noise, "
-                "billing and refund requests. Always create a Location entity for room references (e.g., 'quarto 2'). "
-                "Always create an Issue entity for room complaints (e.g., smell, dirt, noise). "
-                "Link User -> reported_issue -> Issue and Issue -> affects_location -> Location whenever applicable."
+            "billing and refund requests. Always create a Location entity for room references (e.g., 'quarto 2'). "
+            "Always create an Issue entity for room complaints (e.g., smell, dirt, noise). "
+            "Link User -> reported_issue -> Issue and Issue -> affects_location -> Location whenever applicable."
         ),
     },
     "ecommerce_support": {
@@ -109,10 +193,10 @@ PROMPT_PROFILES: dict[str, dict[str, str]] = {
         ),
         "extraction": (
             "Domain: e-commerce. "
-            "Always create a Product entity for any order reference (e.g. 'Pedido 1234' → entity_type Product). "
+            "Always create a Product entity for any order reference (e.g. 'Pedido 1234' -> entity_type Product). "
             "Always create an Issue entity for wrong items, wrong size, damaged goods, missing items, late delivery. "
             "Always create an Activity entity for exchange, return, refund or cancellation requests. "
-            "Link User → reported_issue → Issue, Issue → affects_order → Order, User → requested_action → Activity."
+            "Link User -> reported_issue -> Issue, Issue -> affects_order -> Order, User -> requested_action -> Activity."
         ),
     },
     "saas_support": {
@@ -131,80 +215,120 @@ PROMPT_PROFILES: dict[str, dict[str, str]] = {
             "When using free-form Cypher, keep it read-only, explicit and concise. "
             "Never claim data that was not returned by tools."
         ),
-        "extraction": (
-            "Admin mode does not extract triplets."
-        ),
+        "extraction": ("Admin mode does not extract triplets."),
     },
 }
 
-ADMIN_TOOL_DEFINITIONS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "find_entity",
-            "description": "Find entities by partial name and optional type.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "entity_type": {"type": "string"},
-                },
-                "required": ["name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "neighbors",
-            "description": "Get neighbors of one entity with depth 1 or 2.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "entity_name": {"type": "string"},
-                    "depth": {"type": "integer", "minimum": 1, "maximum": 2},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-                },
-                "required": ["entity_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "recent_relations",
-            "description": "Return most recent relations added/updated in graph.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_graph_query",
-            "description": "Run a read-only Cypher query with strict validation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "cypher": {"type": "string"},
-                    "params": {"type": "object"},
-                },
-                "required": ["cypher"],
-            },
-        },
-    },
-]
+
+DOMAIN_POLICIES: dict[str, DomainPolicy] = {
+    "hotel_customer_service": DomainPolicy(
+        required_relations=(
+            ("User", "reported_issue", "Issue"),
+            ("Issue", "affects_location", "Location"),
+            ("User", "requested_action", "Activity")
+        )
+    ),
+    "ecommerce_support": DomainPolicy(
+        required_relations=(
+            ("User", "reported_issue", "Issue"),
+            ("User", "requested_action", "Activity"),
+            ("Issue", "affects_order", "Product"),
+        )
+    ),
+    "saas_support": DomainPolicy(),
+    "graph_admin_assistant": DomainPolicy(),
+}
+
+
+# Keep relation semantics stable even when models output close paraphrases.
+RELATION_ALIASES: dict[str, str] = {
+    "is_in": "is_at",
+    "located_in": "is_at",
+    "located_at": "is_at",
+    "is_at_location": "is_at",
+    "at_location": "is_at",
+    "in_location": "is_at",
+    "is_inside": "is_at",
+    "inside": "is_at",
+    "in": "is_at",
+    "occupies": "is_at"
+}
+
+
+class ExtractedTriplet(BaseModel):
+    subject: str
+    subject_type: str = "Concept"
+    relation: str
+    object: str
+    object_type: str = "Concept"
+    confidence: float | None = None
+
+
+class ExtractionOutput(BaseModel):
+    triplets: list[ExtractedTriplet] = Field(default_factory=list)
+
+
+class CanonicalizedTriplet(BaseModel):
+    subject: str
+    subject_type: str
+    relation: str
+    object: str
+    object_type: str
+    confidence: float | None = None
+
+
+class ResolutionOutput(BaseModel):
+    triplets: list[CanonicalizedTriplet] = Field(default_factory=list)
+
+
+class PolicyValidationOutput(BaseModel):
+    triplets: list[CanonicalizedTriplet] = Field(default_factory=list)
+    dropped_reasons: list[str] = Field(default_factory=list)
+
+
+@dataclass
+class AdminAgentDeps:
+    graph_tools: AdminGraphTools
+    tool_calls: list[ToolCallRecord]
+    tool_results: list[ToolResultRecord]
+    max_tool_rounds: int
+
+
+@dataclass
+class ResolutionAgentDeps:
+    graph_tools: AdminGraphTools
+    tool_calls: list[ToolCallRecord]
+    tool_results: list[ToolResultRecord]
+    max_tool_rounds: int
 
 
 class LLMExtractor:
-    def __init__(self, api_key: str, base_url: str, model: str, default_confidence: float) -> None:
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        default_confidence: float,
+        provider: str | None = None,
+    ) -> None:
+        settings = get_settings()
         self.default_confidence = default_confidence
+        self.policy_min_triplet_confidence = settings.policy_min_triplet_confidence
+        self.resolution_tool_max_rounds = settings.resolution_tool_max_rounds
+        self.resolution_match_confidence_threshold = settings.resolution_match_confidence_threshold
+        self.model = self._build_model(api_key=api_key, base_url=base_url, model=model, provider=provider)
+
+        self.assistant_agent = Agent(self.model)
+        self.extraction_agent = Agent(self.model, output_type=ExtractionOutput)
+        self.resolution_agent: Agent[ResolutionAgentDeps, ResolutionOutput] = Agent(
+            self.model,
+            output_type=ResolutionOutput,
+            deps_type=ResolutionAgentDeps,
+        )
+        self.policy_agent = Agent(self.model, output_type=PolicyValidationOutput)
+        self.admin_agent: Agent[AdminAgentDeps, str] = Agent(self.model, deps_type=AdminAgentDeps)
+        self._register_resolution_tools()
+        self._register_admin_tools()
 
     @staticmethod
     def resolve_prompt_profile(prompt_profile: str | None) -> str:
@@ -231,351 +355,907 @@ class LLMExtractor:
         message: str,
         user_name: str,
         prompt_profile: str,
-        history: list[dict] | None = None,
+        history: list[ConversationTurn] | None = None,
     ) -> str:
-        messages: list[Any] = [
-            {
-                "role": "system",
-                "content": self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile),
-            }
-        ]
-        for h in (history or [])[-20:]:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": message})
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0.4,
-            messages=messages,
+        prompt = self._conversation_prompt(message=message, history=history)
+        result = self.assistant_agent.run_sync(
+            prompt,
+            instructions=[self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile)],
+            model_settings={"temperature": 0.4},
         )
-        content = completion.choices[0].message.content or ""
-        return content.strip() or "Posso ajudar a detalhar isso melhor se quiser."
+        reply = str(result.output).strip()
+        return reply or "Posso ajudar a detalhar isso melhor se quiser."
 
     def stream_assistant_reply(
         self,
         message: str,
         user_name: str,
         prompt_profile: str,
-        history: list[dict] | None = None,
+        history: list[ConversationTurn] | None = None,
     ) -> Iterator[str]:
-        messages: list[Any] = [
-            {
-                "role": "system",
-                "content": self._assistant_system_prompt(user_name=user_name, prompt_profile=prompt_profile),
-            }
-        ]
-        for h in (history or [])[-20:]:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": message})
-        stream = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0.4,
-            stream=True,
-            messages=messages,
+        prompt = self._conversation_prompt(message=message, history=history)
+        # NOTE: run_stream_sync in this pydantic-ai version does not accept `instructions`.
+        # Build a scoped agent with a dynamic system prompt for this request.
+        scoped_stream_agent = Agent(self.model, system_prompt=self._assistant_system_prompt(user_name, prompt_profile))
+        stream = scoped_stream_agent.run_stream_sync(
+            prompt,
+            model_settings={"temperature": 0.4},
         )
-
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            content = delta.content if delta else None
-            if content:
-                yield content
+        for token in stream.stream_text(delta=True):
+            if token:
+                yield token
 
     def extract_triplets(
         self,
         message: str,
         user_name: str,
         prompt_profile: str,
-        history: list[dict] | None = None,
+        history: list[ConversationTurn] | None = None,
+        prior_session_triplets: list[Triplet] | None = None,
     ) -> list[Triplet]:
-        # Build conversation context from history + current message
-        history_lines = [
-            f"{h['role'].upper()}: {h['content']}"
-            for h in (history or [])[-20:]
-        ]
-        history_lines.append(f"USER: {message}")
-        conversation_text = "\n".join(history_lines)
+        prior_triplets_block = ""
+        if prior_session_triplets:
+            prior_payload = {
+                "session_known_triplets": [
+                    triplet.model_dump(mode="python") for triplet in prior_session_triplets[:20]
+                ]
+            }
+            prior_triplets_block = (
+                "\n\nKnown facts already in this same session graph (avoid semantic duplicates):\n"
+                + json.dumps(prior_payload, ensure_ascii=False)
+            )
 
         extraction_request = (
             f"The customer's real name is {user_name}. When the speaker refers to themselves, use the same "
             f"single entity named {user_name} with entity_type User. "
-            "Extract ALL entities and relations visible in the full conversation below. "
-            'Return a JSON object with keys "entities" and "triplets" only.\n\n'
-            f"Conversation:\n{conversation_text}"
+            "Extract ALL triplets visible in the full conversation below. "
+            "Return a JSON object with key 'triplets' only.\n\n"
+            f"{self._conversation_prompt(message=message, history=history)}"
+            f"{prior_triplets_block}"
         )
+
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": EXTRACTION_PROMPT},
-                    {"role": "system", "content": self._extraction_system_prompt(prompt_profile)},
-                    {"role": "user", "content": extraction_request},
-                ],
+            result = self.extraction_agent.run_sync(
+                extraction_request,
+                instructions=[EXTRACTION_PROMPT, self._extraction_system_prompt(prompt_profile)],
+                model_settings={"temperature": 0},
             )
         except Exception:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": EXTRACTION_PROMPT},
-                    {"role": "system", "content": self._extraction_system_prompt(prompt_profile)},
-                    {"role": "user", "content": extraction_request},
-                ],
+            logger.exception("triplet_extraction_failed")
+            return []
+
+        triplets = [self._to_triplet(item.model_dump(mode="python")) for item in result.output.triplets]
+        triplets = [triplet for triplet in triplets if triplet is not None]
+        if not triplets:
+            return []
+        return self._apply_speaker_name(self._reconcile_entity_types(triplets), user_name)
+
+    def extract_and_stage(
+        self,
+        message: str,
+        user_name: str,
+        prompt_profile: str,
+        graph_repo: GraphRepository,
+        history: list[ConversationTurn] | None = None,
+    ) -> list[Triplet]:
+        history_ids = [str(item["id"]) for item in (history or []) if "id" in item and isinstance(item["id"], int)]
+        prior_rows = graph_repo.list_relations_for_message_ids(message_ids=history_ids, limit=80)
+        prior_session_triplets = [self._to_triplet(row) for row in prior_rows]
+        prior_session_triplets = [triplet for triplet in prior_session_triplets if triplet is not None]
+
+        raw_triplets = self.extract_triplets(
+            message=message,
+            user_name=user_name,
+            prompt_profile=prompt_profile,
+            history=history,
+            prior_session_triplets=prior_session_triplets,
+        )
+        if not raw_triplets:
+            return []
+        logger.info("pipeline_stage extraction triplets={}", len(raw_triplets))
+
+        policy_enforced_triplets = self._apply_domain_policy(raw_triplets, prompt_profile)
+        if len(policy_enforced_triplets) != len(raw_triplets):
+            logger.info(
+                "pipeline_stage domain_policy_enforcement before={} after={}",
+                len(raw_triplets),
+                len(policy_enforced_triplets),
             )
-        raw = completion.choices[0].message.content or "{}"
-        parsed = self._safe_parse_json(raw)
-        if isinstance(parsed, dict):
-            triplets = self._from_entity_graph(parsed)
-            if triplets:
-                return self._apply_speaker_name(self._reconcile_entity_types(triplets), user_name)
+        raw_triplets = policy_enforced_triplets
 
-            items = parsed.get("triplets", [])
-            if isinstance(items, list):
-                legacy = self._from_legacy_triplets(items)
-                if legacy:
-                    return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
+        canonical_triplets = self._lightweight_canonicalize_triplets(raw_triplets)
+        logger.info("pipeline_stage local_canonicalization triplets={}", len(canonical_triplets))
 
-        if isinstance(parsed, list):
-            legacy = self._from_legacy_triplets(parsed)
-            if legacy:
-                return self._apply_speaker_name(self._reconcile_entity_types(legacy), user_name)
+        if self._should_call_resolution_agent(canonical_triplets, graph_repo):
+            resolved_triplets = self.resolve_entity_references(canonical_triplets, graph_repo, prompt_profile)
+            logger.info("pipeline_stage resolution_agent triplets={}", len(resolved_triplets))
+        else:
+            graph_tools = AdminGraphTools(graph_repo=graph_repo, max_rows=100)
+            resolved_triplets = self._reuse_existing_entities(canonical_triplets, graph_tools)
+            logger.info("pipeline_stage resolution_shortcut triplets={}", len(resolved_triplets))
 
-        return []
+        validated_triplets = self.validate_policy(resolved_triplets, prompt_profile)
+        logger.info("pipeline_stage semantic_policy_gate triplets={}", len(validated_triplets))
+        deduped = self._dedupe_triplets(validated_triplets)
+        logger.info("pipeline_stage dedupe triplets={}", len(deduped))
+        return deduped
+
+    def resolve_entity_references(
+        self,
+        triplets: list[Triplet],
+        graph_repo: GraphRepository,
+        prompt_profile: str,
+    ) -> list[Triplet]:
+        if not triplets:
+            return []
+
+        graph_tools = AdminGraphTools(graph_repo=graph_repo, max_rows=100)
+        deps = ResolutionAgentDeps(
+            graph_tools=graph_tools,
+            tool_calls=[],
+            tool_results=[],
+            max_tool_rounds=self.resolution_tool_max_rounds,
+        )
+
+        # Pre-fetch existing entities relevant to the incoming triplets so the agent
+        # can make informed resolution decisions without needing to call tools first.
+        existing_entities = self._fetch_candidate_entities_for_resolution(triplets, graph_tools)
+        existing_entities_block = ""
+        if existing_entities:
+            existing_entities_block = (
+                "\n\nExisting entities in the graph that may be reused (prefer these over creating new paraphrases):\n"
+                + json.dumps(existing_entities, ensure_ascii=False)
+            )
+
+        prompt = (
+            "Resolve these canonical triplets against existing entities in graph.\n"
+            "IMPORTANT: If an incoming entity is semantically equivalent to an existing entity listed below, "
+            "you MUST rewrite the triplet to use the existing entity name exactly as shown.\n"
+            "For example: 'cheiro ruim' and 'mau cheiro' refer to the same problem - use the existing name.\n\n"
+            + json.dumps({"triplets": [triplet.model_dump(mode="python") for triplet in triplets]}, ensure_ascii=False)
+            + existing_entities_block
+        )
+
+        try:
+            result = self.resolution_agent.run_sync(
+                prompt,
+                deps=deps,
+                instructions=[
+                    RESOLUTION_PROMPT,
+                    self._extraction_system_prompt(prompt_profile),
+                    (
+                        "Resolution playbook: Check the 'Existing entities' list provided in the prompt. "
+                        "For Issue entities, identify semantic paraphrases (e.g., 'cheiro ruim' ~ 'mau cheiro', "
+                        "'barulho' ~ 'ruído', 'sujo' ~ 'sujeira') and rewrite to use the EXISTING entity name. "
+                        "If uncertain, you may use tools to explore neighbors and validate context. "
+                        "When rewriting, preserve the exact spelling/casing of the existing entity."
+                    ),
+                ],
+                model_settings={"temperature": 0},
+            )
+            model_resolved = [self._to_triplet(item.model_dump(mode="python")) for item in result.output.triplets]
+            resolved = [triplet for triplet in model_resolved if triplet is not None]
+        except Exception:
+            logger.exception("resolution_stage_failed")
+            resolved = triplets
+
+        # Final deterministic pass to reuse existing entities by normalized name.
+        # This only kicks in for exact/near-exact matches the agent may have missed.
+        return self._reuse_existing_entities(resolved, graph_tools)
+
+    def _fetch_candidate_entities_for_resolution(
+        self,
+        triplets: list[Triplet],
+        graph_tools: AdminGraphTools,
+    ) -> list[dict[str, str]]:
+        """Pre-fetch existing entities relevant to incoming triplets for agent context."""
+        candidates: dict[tuple[str, str], dict[str, str]] = {}
+
+        # Collect all entity names and their salient tokens from incoming triplets
+        search_terms: set[str] = set()
+        for triplet in triplets:
+            for name in [triplet.subject, triplet.object]:
+                search_terms.add(name)
+                search_terms.update(self._salient_tokens(name))
+
+        # Query the graph for each search term
+        for term in search_terms:
+            if len(term) < 3:
+                continue
+            execution = graph_tools.find_entity(name=term, entity_type=None)
+            for row in self._tool_rows(execution):
+                row_name = str(row.get("name", "")).strip()
+                row_type = str(row.get("entity_type", "")).strip()
+                row_norm = str(row.get("normalized_name", "")).strip()
+                if row_name and row_type:
+                    key = (row_type, row_norm or self._normalize_entity_name(row_name))
+                    if key not in candidates:
+                        candidates[key] = {
+                            "name": row_name,
+                            "entity_type": row_type,
+                            "normalized_name": row_norm or self._normalize_entity_name(row_name),
+                        }
+
+        return list(candidates.values())
+
+    def validate_policy(self, triplets: list[Triplet], prompt_profile: str) -> list[Triplet]:
+        if not triplets:
+            return []
+
+        prompt = (
+            "Validate these triplets against graph policy and return corrected triplets.\n\n"
+            + json.dumps({"triplets": [triplet.model_dump(mode="python") for triplet in triplets]}, ensure_ascii=False)
+        )
+        staged: list[Triplet]
+        dropped_reasons: list[str] = []
+        try:
+            result = self.policy_agent.run_sync(
+                prompt,
+                instructions=[
+                    SEMANTIC_POLICY_GATE_PROMPT,
+                    self._extraction_system_prompt(prompt_profile),
+                ],
+                model_settings={"temperature": 0},
+            )
+            staged_candidates = [self._to_triplet(item.model_dump(mode="python")) for item in result.output.triplets]
+            staged = [triplet for triplet in staged_candidates if triplet is not None]
+            dropped_reasons = [reason.strip() for reason in result.output.dropped_reasons if reason.strip()]
+        except Exception:
+            logger.exception("policy_stage_failed")
+            staged = triplets
+
+        if dropped_reasons:
+            logger.info(
+                "pipeline_stage semantic_policy_drops count={} reasons={}",
+                len(dropped_reasons),
+                dropped_reasons,
+            )
+
+        if not staged:
+            return []
+
+        enforced: list[Triplet] = []
+        for triplet in staged:
+            if triplet.confidence < self.policy_min_triplet_confidence:
+                continue
+
+            relation = self._normalize_relation_name(triplet.relation)
+            if triplet.subject_type == "Location" and triplet.object_type == "Issue":
+                # Normalize direction for easier querying: Issue -> affects_location -> Location.
+                enforced.append(
+                    Triplet(
+                        subject=triplet.object,
+                        subject_type="Issue",
+                        relation="affects_location",
+                        object=triplet.subject,
+                        object_type="Location",
+                        confidence=triplet.confidence,
+                    )
+                )
+                continue
+
+            if triplet.subject_type == "Issue" and triplet.object_type == "Location":
+                relation = "affects_location"
+
+            enforced.append(
+                Triplet(
+                    subject=triplet.subject,
+                    subject_type=triplet.subject_type,
+                    relation=relation,
+                    object=triplet.object,
+                    object_type=triplet.object_type,
+                    confidence=triplet.confidence,
+                )
+            )
+        return enforced
 
     def run_admin_assistant_with_tools(
         self,
         message: str,
         user_name: str,
-        history: list[dict] | None,
-        tool_executor: Callable[[str, dict[str, Any]], Any],
-        max_tool_rounds: int = 4,
-    ) -> dict[str, Any]:
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": self._assistant_system_prompt(
-                    user_name=user_name,
-                    prompt_profile="graph_admin_assistant",
-                ),
-            },
-            {
-                "role": "system",
-                "content": (
-                    "Use tools to answer graph questions. "
-                    "If the user asks about relationships, call tools before answering."
-                ),
-            },
+        history: list[ConversationTurn] | None,
+        graph_tools: AdminGraphTools,
+        max_tool_rounds: int = 6,
+    ) -> AdminAssistantRunResult:
+        deps = AdminAgentDeps(
+            graph_tools=graph_tools,
+            tool_calls=[],
+            tool_results=[],
+            max_tool_rounds=max_tool_rounds,
+        )
+        prompt = self._conversation_prompt(message=message, history=history)
+
+        instructions = [
+            self._assistant_system_prompt(user_name=user_name, prompt_profile="graph_admin_assistant"),
+            (
+                "Use tools to answer graph questions. "
+                "Playbook: call describe_graph_schema before free-form Cypher; "
+                "prefer canonical graph model discovered from schema; "
+                "use find_entity/neighbors/shortest_path for targeted exploration; "
+                "use graph_stats for high-level metrics and topology checks; "
+                "use run_graph_query only after aligning labels/properties with discovered schema; "
+                "if query fails with unknown label/property/relationship, refresh schema and retry with corrected Cypher; "
+                "never invent labels like Quarto/Problema/TEM_PROBLEMA unless schema confirms them. "
+                f"Never call tools more than {max_tool_rounds} times."
+            ),
         ]
 
-        for h in (history or [])[-20:]:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": message})
-
-        tool_calls: list[dict[str, Any]] = []
-        tool_results: list[dict[str, Any]] = []
-
-        for _ in range(max_tool_rounds):
-            try:
-                completion = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=0.1,
-                    messages=messages,  # type: ignore[arg-type]
-                    tools=ADMIN_TOOL_DEFINITIONS,  # type: ignore[arg-type]
-                    tool_choice="auto",
-                )
-            except Exception as exc:
-                return {
-                    "assistant_message": (
-                        "Nao consegui usar as tools de grafo com o provedor atual. "
-                        "Verifique suporte a function-calling/ferramentas no modelo configurado."
-                    ),
-                    "tool_calls": [],
-                    "tool_results": [
-                        {
-                            "tool_name": "tool_runtime",
-                            "ok": False,
-                            "result": {"error": str(exc)},
-                            "duration_ms": 0,
-                        }
-                    ],
-                }
-            response_message = completion.choices[0].message
-            response_content = response_message.content or ""
-
-            if not response_message.tool_calls:
-                final_message = response_content.strip() or "Nao encontrei dados no grafo para responder com seguranca."
-                return {
-                    "assistant_message": final_message,
-                    "tool_calls": tool_calls,
-                    "tool_results": tool_results,
-                }
-
-            tool_calls_payload: list[dict[str, Any]] = []
-            tool_results_payload: list[tuple[str, dict[str, Any]]] = []
-            for tc in response_message.tool_calls:
-                function_payload = getattr(tc, "function", None)
-                if function_payload is None:
-                    continue
-
-                function_name = str(getattr(function_payload, "name", "")).strip()
-                if not function_name:
-                    continue
-
-                raw_args = str(getattr(function_payload, "arguments", "{}") or "{}")
-                parsed_args = self._safe_parse_tool_args(raw_args)
-                tool_calls_payload.append(
+        try:
+            result = self.admin_agent.run_sync(
+                prompt,
+                deps=deps,
+                instructions=instructions,
+                model_settings={"temperature": 0.1},
+            )
+            assistant_message = str(result.output).strip() or "Nao encontrei dados no grafo para responder com seguranca."
+            return {
+                "assistant_message": assistant_message,
+                "tool_calls": deps.tool_calls,
+                "tool_results": deps.tool_results,
+            }
+        except Exception as exc:
+            logger.exception("admin_assistant_failed")
+            return {
+                "assistant_message": (
+                    "Nao consegui usar as tools de grafo com o provedor atual. "
+                    "Verifique suporte a function-calling/ferramentas no modelo configurado."
+                ),
+                "tool_calls": deps.tool_calls,
+                "tool_results": deps.tool_results
+                + [
                     {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": function_name,
-                            "arguments": raw_args,
-                        },
-                    }
-                )
-                tool_calls.append({"tool_name": function_name, "arguments": parsed_args})
-
-                tool_result = tool_executor(function_name, parsed_args)
-                if hasattr(tool_result, "__dict__"):
-                    result_payload = dict(tool_result.__dict__)
-                elif isinstance(tool_result, dict):
-                    result_payload = tool_result
-                else:
-                    result_payload = {
-                        "tool_name": function_name,
+                        "tool_name": "tool_runtime",
                         "ok": False,
-                        "result": {"error": "Invalid tool result."},
+                        "result": {"error": str(exc)},
                         "duration_ms": 0,
                     }
-                tool_results.append(result_payload)
-                tool_results_payload.append((tc.id, result_payload))
+                ],
+            }
 
-            # Preserve provider-specific fields from the original assistant message
-            # (e.g. Gemini thought signatures required for subsequent tool turns).
-            messages.append(response_message.model_dump(exclude_none=True))
-            for tool_call_id, result_payload in tool_results_payload:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": json.dumps(result_payload.get("result", {}), ensure_ascii=False),
-                    }
-                )
-
-        return {
-            "assistant_message": "A consulta exigiu muitas iteracoes de ferramenta. Tente refinar a pergunta.",
-            "tool_calls": tool_calls,
-            "tool_results": tool_results,
-        }
-
-    def _from_entity_graph(self, payload: dict[str, Any]) -> list[Triplet]:
-        entities_raw = payload.get("entities", [])
-        triplets_raw = payload.get("triplets", [])
-        if not isinstance(entities_raw, list) or not isinstance(triplets_raw, list):
-            return []
-
-        entities: dict[str, dict[str, str]] = {}
-        entities_by_name: dict[str, dict[str, str]] = {}
-        for item in entities_raw:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            entity_type = str(item.get("entity_type", "Concept")).strip()
-            if not name:
-                continue
-            if entity_type not in ALLOWED_ENTITY_TYPES:
-                entity_type = "Concept"
-            normalized_name = self._normalize_entity_name(name)
-            entity_id = str(item.get("id", "")).strip() or f"name:{normalized_name}"
-            entity_payload = {"name": name, "entity_type": entity_type}
-            entities[entity_id] = entity_payload
-            entities_by_name[normalized_name] = entity_payload
-
-        result: list[Triplet] = []
-        for item in triplets_raw:
-            if not isinstance(item, dict):
-                continue
-            relation = str(item.get("relation", item.get("predicate", ""))).strip()
-            confidence = item.get("confidence", self.default_confidence)
-            if not relation:
-                continue
-
-            subject_entity = None
-            object_entity = None
-
-            subject_id = str(item.get("subject_id", "")).strip()
-            object_id = str(item.get("object_id", "")).strip()
-            if subject_id:
-                subject_entity = entities.get(subject_id)
-            if object_id:
-                object_entity = entities.get(object_id)
-
-            if subject_entity is None:
-                subject_name = str(item.get("subject", "")).strip()
-                subject_type = str(item.get("subject_type", "Concept")).strip()
-                if subject_name:
-                    if subject_type not in ALLOWED_ENTITY_TYPES:
-                        subject_type = "Concept"
-                    subject_entity = entities_by_name.get(
-                        self._normalize_entity_name(subject_name),
-                        {"name": subject_name, "entity_type": subject_type},
-                    )
-
-            if object_entity is None:
-                object_name = str(item.get("object", "")).strip()
-                object_type = str(item.get("object_type", "Concept")).strip()
-                if object_name:
-                    if object_type not in ALLOWED_ENTITY_TYPES:
-                        object_type = "Concept"
-                    object_entity = entities_by_name.get(
-                        self._normalize_entity_name(object_name),
-                        {"name": object_name, "entity_type": object_type},
-                    )
-
-            if not subject_entity or not object_entity:
-                continue
-            normalized = self._normalize_item(
-                {
-                    "subject": subject_entity["name"],
-                    "subject_type": subject_entity["entity_type"],
-                    "relation": relation,
-                    "object": object_entity["name"],
-                    "object_type": object_entity["entity_type"],
-                    "confidence": confidence,
-                }
+    def _register_resolution_tools(self) -> None:
+        @self.resolution_agent.tool
+        def describe_graph_schema(ctx: RunContext[ResolutionAgentDeps]) -> ToolResultRecord:
+            args: ToolArguments = {}
+            return self._execute_resolution_tool_safely(
+                ctx,
+                "describe_graph_schema",
+                args,
+                lambda: ctx.deps.graph_tools.describe_graph_schema(),
             )
-            if normalized is None:
-                continue
-            try:
-                result.append(Triplet(**normalized))
-            except Exception:
-                continue
-        return result
 
-    def _from_legacy_triplets(self, items: list[Any]) -> list[Triplet]:
-        triplets: list[Triplet] = []
-        for item in items:
-            normalized = self._normalize_item(item)
-            if normalized is None:
-                continue
-            try:
-                triplets.append(Triplet(**normalized))
-            except Exception:
-                continue
-        return triplets
+        @self.resolution_agent.tool
+        def find_entity(
+            ctx: RunContext[ResolutionAgentDeps],
+            name: str,
+            entity_type: str | None = None,
+        ) -> ToolResultRecord:
+            args: ToolArguments = {"name": name, "entity_type": entity_type}
+            return self._execute_resolution_tool_safely(
+                ctx,
+                "find_entity",
+                args,
+                lambda: ctx.deps.graph_tools.find_entity(name=name, entity_type=entity_type),
+            )
 
-    def _normalize_item(self, item: Any) -> dict[str, Any] | None:
-        if not isinstance(item, dict):
+        @self.resolution_agent.tool
+        def neighbors(
+            ctx: RunContext[ResolutionAgentDeps],
+            entity_name: str,
+            depth: int = 1,
+            limit: int = 50,
+        ) -> ToolResultRecord:
+            args: ToolArguments = {"entity_name": entity_name, "depth": depth, "limit": limit}
+            return self._execute_resolution_tool_safely(
+                ctx,
+                "neighbors",
+                args,
+                lambda: ctx.deps.graph_tools.neighbors(entity_name=entity_name, depth=depth, limit=limit),
+            )
+
+    def _execute_resolution_tool_safely(
+        self,
+        ctx: RunContext[ResolutionAgentDeps],
+        tool_name: str,
+        arguments: ToolArguments,
+        operation: Callable[[], ToolExecution],
+    ) -> ToolResultRecord:
+        if len(ctx.deps.tool_calls) >= ctx.deps.max_tool_rounds:
+            exhausted = ToolExecution(
+                tool_name=tool_name,
+                ok=False,
+                result={"error": "Tool budget exhausted for resolution stage."},
+                duration_ms=0,
+            )
+            return self._record_resolution_tool_call(ctx, tool_name, arguments, exhausted)
+
+        try:
+            execution = operation()
+        except Exception as exc:
+            logger.exception("resolution_tool_execution_failed tool={}", tool_name)
+            execution = ToolExecution(
+                tool_name=tool_name,
+                ok=False,
+                result={"error": str(exc)},
+                duration_ms=0,
+            )
+        return self._record_resolution_tool_call(ctx, tool_name, arguments, execution)
+
+    def _record_resolution_tool_call(
+        self,
+        ctx: RunContext[ResolutionAgentDeps],
+        tool_name: str,
+        arguments: ToolArguments,
+        execution: ToolExecution,
+    ) -> ToolResultRecord:
+        ctx.deps.tool_calls.append({"tool_name": tool_name, "arguments": arguments})
+        payload: ToolResultRecord = {
+            "tool_name": execution.tool_name,
+            "ok": execution.ok,
+            "result": execution.result,
+            "duration_ms": execution.duration_ms,
+        }
+        ctx.deps.tool_results.append(payload)
+        return payload
+
+    def _register_admin_tools(self) -> None:
+        @self.admin_agent.tool
+        def describe_graph_schema(ctx: RunContext[AdminAgentDeps]) -> ToolResultRecord:
+            """Inspect current graph vocabulary to ground follow-up queries."""
+            args: ToolArguments = {}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "describe_graph_schema",
+                args,
+                lambda: ctx.deps.graph_tools.describe_graph_schema(),
+            )
+
+        @self.admin_agent.tool
+        def find_entity(ctx: RunContext[AdminAgentDeps], name: str, entity_type: str | None = None) -> ToolResultRecord:
+            """Find entities by partial name and optional entity type."""
+            args: ToolArguments = {"name": name, "entity_type": entity_type}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "find_entity",
+                args,
+                lambda: ctx.deps.graph_tools.find_entity(name=name, entity_type=entity_type),
+            )
+
+        @self.admin_agent.tool
+        def neighbors(
+            ctx: RunContext[AdminAgentDeps], entity_name: str, depth: int = 1, limit: int = 50
+        ) -> ToolResultRecord:
+            """Get one-hop or two-hop neighbors for an entity name."""
+            args: ToolArguments = {"entity_name": entity_name, "depth": depth, "limit": limit}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "neighbors",
+                args,
+                lambda: ctx.deps.graph_tools.neighbors(entity_name=entity_name, depth=depth, limit=limit),
+            )
+
+        @self.admin_agent.tool
+        def recent_relations(ctx: RunContext[AdminAgentDeps], limit: int = 50) -> ToolResultRecord:
+            """Return most recent relations added or updated in graph."""
+            args: ToolArguments = {"limit": limit}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "recent_relations",
+                args,
+                lambda: ctx.deps.graph_tools.recent_relations(limit=limit),
+            )
+
+        @self.admin_agent.tool
+        def graph_stats(ctx: RunContext[AdminAgentDeps]) -> ToolResultRecord:
+            """Return graph-level metrics (nodes, edges, per-type counts, average degree)."""
+            args: ToolArguments = {}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "graph_stats",
+                args,
+                lambda: ctx.deps.graph_tools.graph_stats(),
+            )
+
+        @self.admin_agent.tool
+        def shortest_path(
+            ctx: RunContext[AdminAgentDeps],
+            source: str,
+            target: str,
+            max_hops: int = 4,
+        ) -> ToolResultRecord:
+            """Find shortest path between two entities by normalized names."""
+            args: ToolArguments = {"source": source, "target": target, "max_hops": max_hops}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "shortest_path",
+                args,
+                lambda: ctx.deps.graph_tools.shortest_path(source=source, target=target, max_hops=max_hops),
+            )
+
+        @self.admin_agent.tool
+        def run_graph_query(
+            ctx: RunContext[AdminAgentDeps],
+            cypher: str,
+            params: dict[str, object] | None = None,
+        ) -> ToolResultRecord:
+            """Run a read-only Cypher query with validation and row limits."""
+            args: ToolArguments = {"cypher": cypher, "params": params or {}}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "run_graph_query",
+                args,
+                lambda: ctx.deps.graph_tools.run_graph_query(cypher=cypher, params=params or {}),
+            )
+
+    def _execute_admin_tool_safely(
+        self,
+        ctx: RunContext[AdminAgentDeps],
+        tool_name: str,
+        arguments: ToolArguments,
+        operation: Callable[[], ToolExecution],
+    ) -> ToolResultRecord:
+        if len(ctx.deps.tool_calls) >= ctx.deps.max_tool_rounds:
+            exhausted = ToolExecution(
+                tool_name=tool_name,
+                ok=False,
+                result={
+                    "error": (
+                        "Tool budget exhausted. Use previously returned tool results to finish the answer "
+                        "without calling more tools."
+                    )
+                },
+                duration_ms=0,
+            )
+            return self._record_admin_tool_call(ctx, tool_name, arguments, exhausted)
+
+        try:
+            execution = operation()
+        except Exception as exc:
+            logger.exception("admin_tool_execution_failed tool={}", tool_name)
+            execution = ToolExecution(
+                tool_name=tool_name,
+                ok=False,
+                result={"error": str(exc)},
+                duration_ms=0,
+            )
+
+        return self._record_admin_tool_call(ctx, tool_name, arguments, execution)
+
+    def _record_admin_tool_call(
+        self,
+        ctx: RunContext[AdminAgentDeps],
+        tool_name: str,
+        arguments: ToolArguments,
+        execution: ToolExecution,
+    ) -> ToolResultRecord:
+        ctx.deps.tool_calls.append({"tool_name": tool_name, "arguments": arguments})
+
+        payload: ToolResultRecord = {
+            "tool_name": execution.tool_name,
+            "ok": execution.ok,
+            "result": execution.result,
+            "duration_ms": execution.duration_ms,
+        }
+        ctx.deps.tool_results.append(payload)
+        return payload
+
+    def _to_triplet(self, payload: Mapping[str, object]) -> Triplet | None:
+        normalized = self._normalize_item(payload)
+        if normalized is None:
+            return None
+        try:
+            return Triplet(**normalized)
+        except Exception:
             return None
 
+    def _lightweight_canonicalize_triplets(self, triplets: list[Triplet]) -> list[Triplet]:
+        canonicalized: list[Triplet] = []
+        for triplet in triplets:
+            canonicalized.append(
+                Triplet(
+                    subject=self._canonicalize_entity_surface(triplet.subject),
+                    subject_type=triplet.subject_type,
+                    relation=self._normalize_relation_name(triplet.relation),
+                    object=self._canonicalize_entity_surface(triplet.object),
+                    object_type=triplet.object_type,
+                    confidence=triplet.confidence,
+                )
+            )
+        return canonicalized
+
+    def _should_call_resolution_agent(self, triplets: list[Triplet], graph_repo: GraphRepository) -> bool:
+        if not triplets:
+            return False
+
+        graph_tools = AdminGraphTools(graph_repo=graph_repo, max_rows=100)
+        seen_entities: set[tuple[str, str]] = set()
+        missing_match = False
+
+        for triplet in triplets:
+            seen_entities.add((triplet.subject_type, self._normalize_entity_name(triplet.subject)))
+            seen_entities.add((triplet.object_type, self._normalize_entity_name(triplet.object)))
+
+        for entity_type, normalized_name in seen_entities:
+            has_match = self._has_entity_match(
+                entity_name=normalized_name,
+                entity_type=entity_type,
+                graph_tools=graph_tools,
+            )
+            if not has_match:
+                missing_match = True
+                break
+
+        return missing_match
+
+    def _reuse_existing_entities(self, triplets: list[Triplet], graph_tools: AdminGraphTools) -> list[Triplet]:
+        resolved: list[Triplet] = []
+        cache: dict[tuple[str, str], tuple[str, str]] = {}
+
+        for triplet in triplets:
+            subject_name, subject_type = self._lookup_existing_entity(
+                triplet.subject,
+                triplet.subject_type,
+                graph_tools,
+                cache,
+            )
+            object_name, object_type = self._lookup_existing_entity(
+                triplet.object,
+                triplet.object_type,
+                graph_tools,
+                cache,
+            )
+            resolved.append(
+                Triplet(
+                    subject=subject_name,
+                    subject_type=subject_type,
+                    relation=self._normalize_relation_name(triplet.relation),
+                    object=object_name,
+                    object_type=object_type,
+                    confidence=triplet.confidence,
+                )
+            )
+        return resolved
+
+    def _lookup_existing_entity(
+        self,
+        name: str,
+        entity_type: str,
+        graph_tools: AdminGraphTools,
+        cache: dict[tuple[str, str], tuple[str, str]],
+    ) -> tuple[str, str]:
+        normalized_name = self._normalize_entity_name(name)
+        cache_key = (entity_type, normalized_name)
+        if cache_key in cache:
+            return cache[cache_key]
+
+        rows = self._entity_candidate_rows(name=name, entity_type=entity_type, graph_tools=graph_tools)
+        if rows:
+            best_name, best_type, best_score = self._best_entity_match(
+                entity_name=name,
+                entity_type=entity_type,
+                rows=rows,
+            )
+            if best_name and best_type and best_score >= self._match_threshold_for_type(entity_type):
+                cache[cache_key] = (best_name, best_type)
+                return cache[cache_key]
+
+        cache[cache_key] = (name, entity_type)
+        return cache[cache_key]
+
+    def _tool_rows(self, execution: ToolExecution) -> list[dict[str, object]]:
+        if not execution.ok or not isinstance(execution.result, dict):
+            return []
+        rows = execution.result.get("rows")
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _has_entity_match(
+        self,
+        entity_name: str,
+        entity_type: str,
+        graph_tools: AdminGraphTools,
+    ) -> bool:
+        rows = self._entity_candidate_rows(name=entity_name, entity_type=entity_type, graph_tools=graph_tools)
+        if not rows:
+            return False
+        _, _, score = self._best_entity_match(
+            entity_name=entity_name,
+            entity_type=entity_type,
+            rows=rows,
+        )
+        return score >= self._match_threshold_for_type(entity_type)
+
+    def _entity_candidate_rows(
+        self,
+        name: str,
+        entity_type: str,
+        graph_tools: AdminGraphTools,
+    ) -> list[dict[str, object]]:
+        candidates: dict[tuple[str, str], dict[str, object]] = {}
+        queries = [name, *self._salient_tokens(name)]
+        for query in queries:
+            execution = graph_tools.find_entity(name=query, entity_type=entity_type)
+            for row in self._tool_rows(execution):
+                row_name = str(row.get("name", "")).strip()
+                row_type = str(row.get("entity_type", "")).strip()
+                if not row_name or not row_type:
+                    continue
+                row_norm = str(row.get("normalized_name", "")).strip() or self._normalize_entity_name(row_name)
+                candidates[(row_type, row_norm)] = row
+        return list(candidates.values())
+
+    @staticmethod
+    def _salient_tokens(value: str) -> list[str]:
+        stop_tokens = {
+            "de",
+            "da",
+            "do",
+            "das",
+            "dos",
+            "a",
+            "o",
+            "as",
+            "os",
+            "em",
+            "no",
+            "na",
+            "com",
+            "para",
+        }
+        normalized = " ".join(value.strip().lower().replace("_", " ").split())
+        tokens = [token for token in normalized.split() if len(token) >= 4 and token not in stop_tokens]
+        # Preserve order while deduping.
+        return list(dict.fromkeys(tokens))
+
+    def _match_threshold_for_type(self, entity_type: str) -> float:
+        if entity_type == "Activity":
+            return max(0.7, self.resolution_match_confidence_threshold - 0.1)
+        if entity_type == "Issue":
+            return max(0.75, self.resolution_match_confidence_threshold - 0.05)
+        return self.resolution_match_confidence_threshold
+
+    def _best_entity_match(
+        self,
+        entity_name: str,
+        entity_type: str,
+        rows: list[dict[str, object]],
+    ) -> tuple[str | None, str | None, float]:
+        target = self._normalize_entity_name(entity_name)
+        best_name: str | None = None
+        best_type: str | None = None
+        best_score = 0.0
+
+        for row in rows:
+            row_type = str(row.get("entity_type", "")).strip()
+            row_name = str(row.get("name", "")).strip()
+            row_normalized = str(row.get("normalized_name", "")).strip() or self._normalize_entity_name(row_name)
+            if not row_name or row_type != entity_type:
+                continue
+
+            score = self._entity_match_score(target=target, candidate=self._normalize_entity_name(row_normalized))
+            if score > best_score:
+                best_score = score
+                best_name = row_name
+                best_type = row_type
+
+        return best_name, best_type, best_score
+
+    @staticmethod
+    def _entity_match_score(target: str, candidate: str) -> float:
+        if not target or not candidate:
+            return 0.0
+        if target == candidate:
+            return 1.0
+
+        # Blend edit similarity and token overlap for stable fuzzy reuse decisions.
+        seq_ratio = SequenceMatcher(None, target, candidate).ratio()
+        target_tokens = set(target.split())
+        candidate_tokens = set(candidate.split())
+        if not target_tokens or not candidate_tokens:
+            token_jaccard = 0.0
+        else:
+            token_jaccard = len(target_tokens & candidate_tokens) / len(target_tokens | candidate_tokens)
+
+        return (seq_ratio * 0.7) + (token_jaccard * 0.3)
+
+    def _apply_domain_policy(self, triplets: list[Triplet], prompt_profile: str) -> list[Triplet]:
+        if not triplets:
+            return []
+
+        profile_key = self.resolve_prompt_profile(prompt_profile)
+        policy = DOMAIN_POLICIES.get(profile_key)
+        if policy is None or not policy.required_relations:
+            return triplets
+
+        enriched = list(triplets)
+        existing_keys = {
+            (
+                triplet.subject_type,
+                self._normalize_entity_name(triplet.subject),
+                self._normalize_relation_name(triplet.relation),
+                triplet.object_type,
+                self._normalize_entity_name(triplet.object),
+            )
+            for triplet in triplets
+        }
+
+        entities_by_type: dict[str, set[str]] = {}
+        for triplet in triplets:
+            entities_by_type.setdefault(triplet.subject_type, set()).add(triplet.subject)
+            entities_by_type.setdefault(triplet.object_type, set()).add(triplet.object)
+
+        for subject_type, relation, object_type in policy.required_relations:
+            subjects = sorted(entities_by_type.get(subject_type, set()))
+            objects = sorted(entities_by_type.get(object_type, set()))
+
+            # Deterministic safety: only auto-link when relation is unambiguous in context.
+            if len(subjects) != 1 or len(objects) != 1:
+                continue
+
+            subject = subjects[0]
+            obj = objects[0]
+            key = (
+                subject_type,
+                self._normalize_entity_name(subject),
+                self._normalize_relation_name(relation),
+                object_type,
+                self._normalize_entity_name(obj),
+            )
+            if key in existing_keys:
+                continue
+
+            enriched.append(
+                Triplet(
+                    subject=subject,
+                    subject_type=subject_type,
+                    relation=relation,
+                    object=obj,
+                    object_type=object_type,
+                    confidence=self.default_confidence,
+                )
+            )
+            existing_keys.add(key)
+
+        return enriched
+
+    def _dedupe_triplets(self, triplets: list[Triplet]) -> list[Triplet]:
+        deduped: dict[tuple[str, str, str, str, str], Triplet] = {}
+        for triplet in triplets:
+            key = (
+                triplet.subject_type,
+                self._normalize_entity_name(triplet.subject),
+                self._normalize_relation_name(triplet.relation),
+                triplet.object_type,
+                self._normalize_entity_name(triplet.object),
+            )
+            existing = deduped.get(key)
+            if existing is None or triplet.confidence > existing.confidence:
+                deduped[key] = Triplet(
+                    subject=triplet.subject,
+                    subject_type=triplet.subject_type,
+                    relation=self._normalize_relation_name(triplet.relation),
+                    object=triplet.object,
+                    object_type=triplet.object_type,
+                    confidence=triplet.confidence,
+                )
+        return list(deduped.values())
+
+    @staticmethod
+    def _normalize_relation_name(value: str) -> str:
+        normalized = "_".join(value.strip().lower().replace("-", " ").split())
+        return RELATION_ALIASES.get(normalized, normalized)
+
+    @staticmethod
+    def _canonicalize_entity_surface(value: str) -> str:
+        return " ".join(value.strip().replace("_", " ").split())
+
+    def _normalize_item(self, item: Mapping[str, object]) -> NormalizedTripletPayload | None:
         subject = str(item.get("subject", "")).strip()
         subject_type = str(item.get("subject_type", "Concept")).strip()
         relation = str(item.get("relation", "")).strip()
         obj = str(item.get("object", "")).strip()
         object_type = str(item.get("object_type", "Concept")).strip()
-        confidence = item.get("confidence", self.default_confidence)
+        confidence_raw = item.get("confidence", self.default_confidence)
 
         if not subject or not relation or not obj:
             return None
@@ -586,7 +1266,7 @@ class LLMExtractor:
             object_type = "Concept"
 
         try:
-            confidence = float(confidence)
+            confidence = float(str(confidence_raw))
         except (TypeError, ValueError):
             confidence = self.default_confidence
 
@@ -603,7 +1283,7 @@ class LLMExtractor:
 
     @staticmethod
     def _normalize_entity_name(value: str) -> str:
-        return " ".join(value.strip().lower().split())
+        return " ".join(value.strip().lower().replace("_", " ").split())
 
     def _reconcile_entity_types(self, triplets: list[Triplet]) -> list[Triplet]:
         if not triplets:
@@ -673,45 +1353,40 @@ class LLMExtractor:
             )
         return self._reconcile_entity_types(resolved)
 
-    @staticmethod
-    def _safe_parse_json(raw: str) -> dict[str, Any] | list[Any]:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
+    def _conversation_prompt(self, message: str, history: list[ConversationTurn] | None = None) -> str:
+        history_lines = [f"{h['role'].upper()}: {h['content']}" for h in (history or [])[-20:]]
+        history_lines.append(f"USER: {message}")
+        return "Conversation:\n" + "\n".join(history_lines)
 
-        fenced_match = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", raw, flags=re.DOTALL)
-        if fenced_match:
-            candidate = fenced_match.group(1)
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+    def _build_model(self, api_key: str, base_url: str, model: str, provider: str | None) -> Model:
+        provider_name = self._normalize_provider_name(provider)
+        model_name = (model or "").strip() or ("gemini-2.5-flash" if provider_name.startswith("google") else "gpt-4o-mini")
+        provider_base_url = (base_url or "").strip() or None
 
-        object_match = re.search(r"(\{.*\})", raw, flags=re.DOTALL)
-        if object_match:
-            candidate = object_match.group(1)
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+        if provider_name in {"google-gla", "google-vertex"}:
+            google_provider = GoogleProvider(
+                api_key=api_key or None,
+                vertexai=(provider_name == "google-vertex"),
+                base_url=provider_base_url,
+            )
+            return GoogleModel(model_name=model_name, provider=google_provider)
 
-        array_match = re.search(r"(\[.*\])", raw, flags=re.DOTALL)
-        if array_match:
-            candidate = array_match.group(1)
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+        if provider_name != "openai":
+            raise ValueError(
+                "Unsupported LLM provider. Use one of: openai, google-gla, google-vertex "
+                "(configured via LLM_PROVIDER)."
+            )
 
-        return {"triplets": []}
+        openai_provider = OpenAIProvider(api_key=api_key or None, base_url=provider_base_url)
+        return OpenAIResponsesModel(model_name=model_name, provider=openai_provider)
 
     @staticmethod
-    def _safe_parse_tool_args(raw: str) -> dict[str, Any]:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            return {}
-        return {}
+    def _normalize_provider_name(provider: str | None) -> str:
+        normalized = (provider or "").strip().lower()
+        if normalized in {"gemini", "google", "google-gla"}:
+            return "google-gla"
+        if normalized in {"vertexai", "google-vertex"}:
+            return "google-vertex"
+        if normalized in {"openai", "openai-chat"}:
+            return "openai"
+        return normalized or "openai"

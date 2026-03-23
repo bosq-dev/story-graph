@@ -1,5 +1,4 @@
 import json
-import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 from collections.abc import Iterator
@@ -10,9 +9,9 @@ from fastapi.responses import StreamingResponse
 from app.schemas import AdminChatRequest
 from app.services.admin_graph_tools import AdminGraphTools
 from app.state import AppServices
+from loguru import logger
 
 router = APIRouter(prefix="/admin/chat", tags=["admin-chat"])
-logger = logging.getLogger(__name__)
 
 
 def get_services(request: Request) -> AppServices:
@@ -43,7 +42,7 @@ def send_admin_message_stream(
 
     graph_tools = AdminGraphTools(graph_repo=services.graph_repo)
     logger.info(
-        "admin_stream_start request_id=%s session_id=%s user_name=%s history_items=%s",
+        "admin_stream_start request_id={} session_id={} user_name={} history_items={}",
         request_id,
         session_id,
         payload.user_name,
@@ -56,7 +55,7 @@ def send_admin_message_stream(
                 message=payload.message,
                 user_name=payload.user_name,
                 history=history,
-                tool_executor=graph_tools.execute_tool,
+                graph_tools=graph_tools,
             )
             tool_calls = outcome.get("tool_calls", [])
             tool_results = outcome.get("tool_results", [])
@@ -76,7 +75,7 @@ def send_admin_message_stream(
 
             services.chat_repo.add_message(session_id, "assistant", assistant_message)
             logger.info(
-                "admin_stream_done request_id=%s session_id=%s tool_calls=%s tool_results=%s assistant_len=%s",
+                "admin_stream_done request_id={} session_id={} tool_calls={} tool_results={} assistant_len={}",
                 request_id,
                 session_id,
                 len(tool_calls),
@@ -95,7 +94,7 @@ def send_admin_message_stream(
                 },
             )
         except Exception as exc:
-            logger.exception("admin_stream_error request_id=%s session_id=%s", request_id, session_id)
+            logger.exception("admin_stream_error request_id={} session_id={}", request_id, session_id)
             yield format_sse(
                 "error",
                 {

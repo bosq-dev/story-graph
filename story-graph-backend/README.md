@@ -1,6 +1,26 @@
 # Story Graph Backend
 
-Backend em FastAPI que recebe mensagens de chat, usa um LLM compatível com OpenAI para extrair triplas de conhecimento e grava o resultado em Neo4j com deduplicacao.
+Backend em FastAPI que recebe mensagens de chat, usa agentes com pydantic-ai (agnostico a provedor) para extrair triplas de conhecimento e grava o resultado em Neo4j com deduplicacao.
+
+## Configuracao de LLM
+
+Use as variaveis abaixo para selecionar provedor e modelo:
+
+- `LLM_API_KEY`
+- `LLM_BASE_URL`
+- `LLM_MODEL` (ex.: `gpt-4o-mini`, `gemini-2.0-flash`, `openai:gpt-4o-mini`, `google-gla:gemini-2.0-flash`)
+- `LLM_PROVIDER` (ex.: `openai`, `google-gla`, `google-vertex`; opcional quando `LLM_MODEL` inclui prefixo)
+
+Exemplos rapidos:
+
+- OpenAI:
+	- `LLM_PROVIDER=openai`
+	- `LLM_MODEL=gpt-4o-mini`
+	- `LLM_API_KEY=<sua-chave-openai>`
+- Gemini (Google AI Studio):
+	- `LLM_PROVIDER=google-gla`
+	- `LLM_MODEL=gemini-3-flash-preview`
+	- `LLM_API_KEY=<sua-chave-google>`
 
 ## Fluxo
 
