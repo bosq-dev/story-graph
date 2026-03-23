@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
+from typing import Any
 
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Session
 from loguru import logger
 
 from app.config import ALLOWED_ENTITY_TYPES
@@ -35,7 +36,7 @@ class GraphRepository:
             session.run(constraint_query)
             self._run_normalization_maintenance(session)
 
-    def _run_normalization_maintenance(self, session) -> None:
+    def _run_normalization_maintenance(self, session: Session) -> None:
         renamed_count = int(
             (
                 session.run(
@@ -107,7 +108,7 @@ class GraphRepository:
 
     @staticmethod
     def _resolve_entity_type(
-        session,
+        session: Session,
         normalized_name: str,
         requested_type: str,
         type_cache: dict[str, str],
@@ -224,7 +225,7 @@ class GraphRepository:
                 )
         return len(triplets)
 
-    def list_entities(self, limit: int = 200) -> list[dict]:
+    def list_entities(self, limit: int = 200) -> list[dict[str, Any]]:
         query = """
         MATCH (e:Entity)
         RETURN e.name AS name, e.normalized_name AS normalized_name, e.entity_type AS entity_type
@@ -235,7 +236,7 @@ class GraphRepository:
             result = session.run(query, limit=limit)
             return [record.data() for record in result]
 
-    def list_relations(self, limit: int = 200) -> list[dict]:
+    def list_relations(self, limit: int = 200) -> list[dict[str, Any]]:
         query = """
         MATCH (s:Entity)-[r:RELATED]->(o:Entity)
         RETURN
@@ -255,7 +256,7 @@ class GraphRepository:
             result = session.run(query, limit=limit)
             return [record.data() for record in result]
 
-    def list_recent(self, limit: int = 20) -> list[dict]:
+    def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
         query = """
         MATCH (s:Entity)-[r:RELATED]->(o:Entity)
         RETURN
@@ -271,7 +272,7 @@ class GraphRepository:
             result = session.run(query, limit=limit)
             return [record.data() for record in result]
 
-    def list_relations_for_message_ids(self, message_ids: list[str], limit: int = 80) -> list[dict]:
+    def list_relations_for_message_ids(self, message_ids: list[str], limit: int = 80) -> list[dict[str, Any]]:
         if not message_ids:
             return []
 
@@ -303,11 +304,11 @@ class GraphRepository:
         cypher: str,
         params: dict | None = None,
         row_limit: int = 200,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(row_limit), 500))
         with self._driver.session(database=self.database) as session:
             result = session.run(cypher, **(params or {}))  # type: ignore[arg-type]
-            rows: list[dict] = []
+            rows: list[dict[str, Any]] = []
             for index, record in enumerate(result):
                 if index >= safe_limit:
                     break

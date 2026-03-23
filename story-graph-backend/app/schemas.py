@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -107,10 +107,38 @@ class AdminToolCall(BaseModel):
     arguments: dict
 
 
+class ToolRowsResult(TypedDict):
+    rows: list[dict[str, Any]]
+    row_count: int
+
+
+class ToolErrorResult(TypedDict):
+    error: str
+
+
+class GraphSchemaResult(TypedDict):
+    labels: list[str]
+    relationship_types: list[str]
+    entity_types: list[str]
+    relation_types: list[str]
+    sample_entities: list[dict[str, Any]]
+
+
+class GraphStatsResult(TypedDict):
+    node_count: int
+    relation_count: int
+    node_counts_by_type: list[dict[str, Any]]
+    relation_counts_by_type: list[dict[str, Any]]
+    avg_out_degree: float
+
+
+AdminToolPayload = ToolRowsResult | ToolErrorResult | GraphSchemaResult | GraphStatsResult
+
+
 class AdminToolResult(BaseModel):
     tool_name: str
     ok: bool
-    result: list[dict] | dict
+    result: AdminToolPayload
     duration_ms: int
 
 

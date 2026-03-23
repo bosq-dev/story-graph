@@ -15,12 +15,12 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.config import ALLOWED_ENTITY_TYPES, get_settings
 from app.schemas import Triplet
-from app.services.admin_graph_tools import AdminGraphTools, ToolExecution
+from app.services.admin_graph_tools import AdminGraphTools, ToolExecution, ToolResultPayload
 from app.services.graph_repository import GraphRepository
 
 
 ToolArguments: TypeAlias = dict[str, object]
-ToolResultData: TypeAlias = dict[str, object] | list[dict[str, object]]
+ToolResultData: TypeAlias = ToolResultPayload
 
 
 class ConversationTurn(TypedDict):
@@ -671,7 +671,8 @@ class LLMExtractor:
                 "Use tools to answer graph questions. "
                 "Playbook: call describe_graph_schema before free-form Cypher; "
                 "prefer canonical graph model discovered from schema; "
-                "use find_entity/neighbors for targeted exploration; "
+                "use find_entity/neighbors/shortest_path for targeted exploration; "
+                "use graph_stats for high-level metrics and topology checks; "
                 "use run_graph_query only after aligning labels/properties with discovered schema; "
                 "if query fails with unknown label/property/relationship, refresh schema and retry with corrected Cypher; "
                 "never invent labels like Quarto/Problema/TEM_PROBLEMA unless schema confirms them. "
@@ -841,6 +842,33 @@ class LLMExtractor:
                 "recent_relations",
                 args,
                 lambda: ctx.deps.graph_tools.recent_relations(limit=limit),
+            )
+
+        @self.admin_agent.tool
+        def graph_stats(ctx: RunContext[AdminAgentDeps]) -> ToolResultRecord:
+            """Return graph-level metrics (nodes, edges, per-type counts, average degree)."""
+            args: ToolArguments = {}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "graph_stats",
+                args,
+                lambda: ctx.deps.graph_tools.graph_stats(),
+            )
+
+        @self.admin_agent.tool
+        def shortest_path(
+            ctx: RunContext[AdminAgentDeps],
+            source: str,
+            target: str,
+            max_hops: int = 4,
+        ) -> ToolResultRecord:
+            """Find shortest path between two entities by normalized names."""
+            args: ToolArguments = {"source": source, "target": target, "max_hops": max_hops}
+            return self._execute_admin_tool_safely(
+                ctx,
+                "shortest_path",
+                args,
+                lambda: ctx.deps.graph_tools.shortest_path(source=source, target=target, max_hops=max_hops),
             )
 
         @self.admin_agent.tool
