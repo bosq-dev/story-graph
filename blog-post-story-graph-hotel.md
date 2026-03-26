@@ -4,7 +4,7 @@
 
 Insights de chatbot ainda são pouco explorados. A maior parte das soluções fala de memória em texto puro, mas quase não transforma conversa em dado estruturado.
 
-Neste projeto, cada mensagem do chat pode virar triplas semânticas, que são persistidas em um grafo consultável. Com isso, saímos do "parece que os usuários reclamam disso" para "estes usuários, nestes locais, com estes problemas, nestes padrões".
+Neste projeto, cada mensagem do chat pode virar triplas semânticas, persistidas em um grafo consultável. Com isso, saímos do "parece que os usuários reclamam disso" para "estes usuários, nestes locais, com estes problemas, nestes padrões".
 
 E essa estratégia funciona para qualquer domínio em que conversas carregam sinais de negócio.
 
@@ -65,6 +65,7 @@ Cada mensagem parece simples, mas o valor real está nas conexões:
 
 É exatamente esse tipo de conexão que transformamos em grafo.
 
+
 ---
 
 ## O que é uma tripla? E o que é um grafo?
@@ -97,14 +98,55 @@ Por que isso importa?
 - dá para consultar recorrência,
 - dá para explicar conexões via caminhos,
 - dá para rastrear de qual mensagem cada relação veio.
+---
 
-## TODO: Exemplo das conversas
+
+Vamos ver como isso se comporta no Story Graph
+
+Vamos começar pelo usuario Ana, que conversa com o chat bot tento algumas reclamações
+
+![Chat Ana](resources/Chat_ana01.png)
+
+Varias informações foram extraidas sobre a Ana nesse chat
+
+![Grafo Ana](resources/grafo_ana.png)
+O agente já foi capaz de criar essa estrutura, representando que ela relatou um problema "Cheiro Ruim", que está relacionado com o Quarto 2, no qual ela esta hospedada. Ela também pediu uma troca de quarto e reembolso devido a esse cheiro. 
+
+O story-graph salva metadados interessantes que ajudam com explicatividade, 
+
+![Requested action ana](resources/ana_requested_action.png)
+
+Ele salva a mensagem que gerou essa relação, nesse exemplo da Ana -> Pediu -> Troca de quarto, foi criada na mensagem que ela pede a troca, como esperado.
+
+Agora vamos ver outro usuario com reclamações similares
+
+![Chat Bruno](resources/Chat_bruno01.png)
+
+Bruno também ficou no quarto 2 e relatou problemas similarias a de Ana, o agente extrator percebeu isso e reutilizou entidades e relacionamentos para gerar um grafo com insights interessantes
+
+![Grafo Bruno e Ana](resources/grafo_ana_e_bruno.png)
+Agora sabemos que o quarto 2 foi ocupado pelo Bruno e pela Ana, e que ambos relataram "cheiro ruim".
+
+
+O grafo pode crescer também de forma separada, por exemplo o Diego ficou em outro quarto e fez reclamações não relacionadas a mal cheiro
+
+![Chat Diego](resources/Chat_diego.png)
+
+
+Logo, essa parte do grafo ficou separada dos usuarios do quarto 2
+
+![Grafo Completo](resources/Grafo_completo.png)
 
 ---
 
-## Pipeline de agentes que extrai as triplas
 
-A pipeline atual do backend segue esta ordem:
+
+---
+## Como o modelo aprende sobre os usuários?
+
+### Pipeline de agentes que extrai as triplas
+
+Existe uma pipelin, que extrai as triplas que funciona assim:
 
 1. `extraction_agent` extrai triplas da conversa recente.
 2. Entra uma camada de `domain policy` para reforçar relações obrigatórias por domínio.
@@ -118,7 +160,7 @@ No fim, cada relação salva metadados de rastreio (mensagem de origem, confiden
 ---
 
 ## Como o chatbot admin caminha o grafo
-TODO: adicionar prints do adm chat
+
 
 No modo admin, o assistente usa tools para explorar o grafo com segurança.
 
@@ -132,17 +174,10 @@ Tools principais:
 - `recent_relations`
 - `run_graph_query` (somente leitura)
 
-Exemplos de perguntas que funcionam bem:
+Exemplo de uso
 
-- "Quais problemas mais recorrentes por quarto?"
-- "Quais clientes pediram reembolso?"
-- "Qual o menor caminho entre Diego e quarto 7?"
+![Chat adm](resources/Chat_adm.png)
 
-Exemplo de caminho explicável:
-
-- `Diego -> reported_issue -> troca de enxoval -> affects_location -> quarto 7`
-
-Esse tipo de resposta é importante porque não apenas diz o resultado, mas mostra a trilha de evidências no grafo.
 
 ---
 

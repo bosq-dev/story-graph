@@ -1,14 +1,15 @@
-# Story Graph Demo
+# Story Graph
 
-Demo local que transforma conversas em linguagem natural em um grafo de conhecimento consultavel.
+Transforme suas conversas em linguagem natural em um grafo de conhecimento consultavel.
 
-## O que a demo mostra
+## O que esse projeto faz?
 
 - Usuario conversa em uma UI de chat (Streamlit).
 - Backend FastAPI envia cada mensagem para agentes pydantic-ai (agnosticos a provedor).
 - O LLM retorna triplas estruturadas.
 - O backend faz upsert dessas triplas no Neo4j com deduplicacao.
 - Historico do chat fica salvo em SQLite.
+- Consulte o grafico a partir do admin chat
 
 ## Stack
 
@@ -125,6 +126,7 @@ docker compose up --build
 - Frontend: `http://localhost:8501`
 - Backend: `http://localhost:8000`
 - Neo4j Browser: `http://localhost:7474`
+- Voce pode visualizar o grafo criado na UI do Neo4j em `http://localhost:7474`.
 
 ## Variaveis principais
 
