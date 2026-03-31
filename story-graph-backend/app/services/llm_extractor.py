@@ -185,27 +185,26 @@ PROMPT_PROFILES: dict[str, dict[str, str]] = {
             "Link User -> reported_issue -> Issue and Issue -> affects_location -> Location whenever applicable."
         ),
     },
-    "ecommerce_support": {
-        "label": "E-commerce Support",
+    "online_sales_intelligence": {
+        "label": "Online Sales Intelligence",
         "assistant": (
-            "You are an e-commerce customer support assistant for orders, shipping, returns and refunds. "
-            "Guide users with clear next steps and expected resolution path."
+            "You are an online sales assistant focused on discovering purchase intent patterns across many users. "
+            "Prioritize concise discovery of buyer goals, preferred products, competitor comparisons, and demographic context. "
+            "When useful, ask one high-impact follow-up question that improves segmentation (for example age range, budget, or intended use). "
+            "Do not invent discounts, policy guarantees, or stock levels."
         ),
         "extraction": (
-            "Domain: e-commerce. "
-            "Always create a Product entity for any order reference (e.g. 'Pedido 1234' -> entity_type Product). "
-            "Always create an Issue entity for wrong items, wrong size, damaged goods, missing items, late delivery. "
-            "Always create an Activity entity for exchange, return, refund or cancellation requests. "
-            "Link User -> reported_issue -> Issue, Issue -> affects_order -> Order, User -> requested_action -> Activity."
-        ),
-    },
-    "saas_support": {
-        "label": "SaaS Support",
-        "assistant": (
-            "You are a SaaS support assistant for account access, billing plans, integrations, incidents and feature requests."
-        ),
-        "extraction": (
-            "Focus on incident reports, blocked workflows, integration requests, subscription changes and feature requests."
+            "Domain: online sales intelligence and conversation mapping. "
+            "Extract entities and relations that support cross-user analytics for common paths, top competitors, and top product interest. "
+            "Use Company for competitor brands and stores mentioned by the customer. "
+            "Use Product for products, collections, SKUs, and categories the customer shows interest in. "
+            "Use Concept for demographic or segmentation descriptors, including age values and age ranges (examples: '29', '25-34', 'under_25'). "
+            "Use Location for geography or channel access context when stated (city, region, store, landing page section). "
+            "Use Activity for clear purchase-intent actions (request_quote, ask_discount, compare_options, wants_to_buy, wants_demo). "
+            "Prefer these relation names: interested_in, mentioned_competitor, compares_with, has_age_segment, accesses_channel, requested_action, reported_issue. "
+            "If the customer explicitly states age, always capture User -> has_age_segment -> Concept. "
+            "If the customer compares alternatives, capture User -> mentioned_competitor -> Company and Product -> compares_with -> Company when explicit. "
+            "If product interest exists, capture User -> interested_in -> Product."
         ),
     },
     "graph_admin_assistant": {
@@ -228,30 +227,15 @@ DOMAIN_POLICIES: dict[str, DomainPolicy] = {
             ("User", "requested_action", "Activity")
         )
     ),
-    "ecommerce_support": DomainPolicy(
+    "online_sales_intelligence": DomainPolicy(
         required_relations=(
-            ("User", "reported_issue", "Issue"),
+            ("User", "interested_in", "Product"),
+            ("User", "mentioned_competitor", "Company"),
+            ("User", "has_age_segment", "Concept"),
             ("User", "requested_action", "Activity"),
-            ("Issue", "affects_order", "Product"),
         )
     ),
-    "saas_support": DomainPolicy(),
     "graph_admin_assistant": DomainPolicy(),
-}
-
-
-# Keep relation semantics stable even when models output close paraphrases.
-RELATION_ALIASES: dict[str, str] = {
-    "is_in": "is_at",
-    "located_in": "is_at",
-    "located_at": "is_at",
-    "is_at_location": "is_at",
-    "at_location": "is_at",
-    "in_location": "is_at",
-    "is_inside": "is_at",
-    "inside": "is_at",
-    "in": "is_at",
-    "occupies": "is_at"
 }
 
 
@@ -1242,8 +1226,8 @@ class LLMExtractor:
 
     @staticmethod
     def _normalize_relation_name(value: str) -> str:
-        normalized = "_".join(value.strip().lower().replace("-", " ").split())
-        return RELATION_ALIASES.get(normalized, normalized)
+        # Canonical relation aliasing is centralized in GraphRepository._normalize_relation.
+        return "_".join(value.strip().lower().replace("-", " ").split())
 
     @staticmethod
     def _canonicalize_entity_surface(value: str) -> str:

@@ -8,8 +8,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
 
 PROMPT_PROFILE_OPTIONS = {
     "hotel_customer_service": "Hotel Customer Service",
-    "ecommerce_support": "E-commerce Reclamações",
-    "saas_support": "SaaS Support",
+    "online_sales_intelligence": "Online Sales Intelligence",
 }
 
 
