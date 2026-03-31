@@ -86,7 +86,7 @@ A menor unidade de conhecimento aqui é a tripla:
 - relation
 - object
 
-Com tipos e confiança, por exemplo:
+Com tipos, por exemplo:
 
 - Ana (User) -> reported_issue -> cheiro ruim (Issue)
 - cheiro ruim (Issue) -> affects_location -> quarto 2 (Location)
